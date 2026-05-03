@@ -207,7 +207,9 @@ pub fn Query(comptime terms: anytype) type {
 
         /// Represents a view into the world, providing access to one entity and its components.
         pub const View = struct {
+            /// The world this view is associated with.
             world: *World,
+            /// Represents the current entity in the existing view
             entity: root.EntityId,
 
             /// Returns a pointer to the component of type `T` for this entity.

@@ -37,7 +37,7 @@ test "filter: With" {
     });
     _ = enemy;
 
-    var query = world.query(.{ Position, clutch.With(Player) });
+    var query = world.query(.{Position}, .{clutch.With(Player)});
     var count: usize = 0;
     while (query.next()) |view| {
         const pos = view.get(Position);
