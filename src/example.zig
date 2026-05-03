@@ -1,3 +1,6 @@
+//! examples to get a rough idea of what the API should look like.
+//!
+//! also conveniently works as a testing interface.
 const std = @import("std");
 const clutch = @import("root.zig");
 
@@ -19,7 +22,7 @@ const DamageEvent = struct { target: clutch.EntityId, amount: f32 };
 // --- filters ---
 
 test "filter: With" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const player = try world.spawn(.{
@@ -46,7 +49,7 @@ test "filter: With" {
 }
 
 test "filter: Without" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     _ = try world.spawn(.{ Position{ .x = 0, .y = 0 }, Player{} });
@@ -60,7 +63,7 @@ test "filter: Without" {
 }
 
 test "filter: Added" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const e1 = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -81,7 +84,7 @@ test "filter: Added" {
 }
 
 test "filter: Changed" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const e1 = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -107,7 +110,7 @@ test "filter: Changed" {
 // --- events ---
 
 test "events: send and read" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const a = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -126,7 +129,7 @@ test "events: send and read" {
 }
 
 test "events: cleared each tick" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const a = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -143,7 +146,7 @@ test "events: cleared each tick" {
 }
 
 test "events: multiple event types" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const e = try world.spawn(.{Health{ .hp = 100 }});
@@ -161,7 +164,7 @@ test "events: multiple event types" {
 // --- hierarchy ---
 
 test "hierarchy: set and get parent" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const parent = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -174,7 +177,7 @@ test "hierarchy: set and get parent" {
 }
 
 test "hierarchy: children iteration" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const parent = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -193,7 +196,7 @@ test "hierarchy: children iteration" {
 }
 
 test "hierarchy: despawn parent cascades to children" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const parent = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -207,7 +210,7 @@ test "hierarchy: despawn parent cascades to children" {
 }
 
 test "hierarchy: remove parent" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const parent = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -239,7 +242,7 @@ fn onHealthRemoved(world: *clutch.World, entity: clutch.EntityId) void {
 test "hooks: onAdd fires when component is added" {
     hook_add_count = 0;
 
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     world.onAdd(Health, onHealthAdded);
@@ -255,7 +258,7 @@ test "hooks: onAdd fires when component is added" {
 test "hooks: onRemove fires when component is removed" {
     hook_remove_count = 0;
 
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     world.onRemove(Health, onHealthRemoved);
@@ -269,7 +272,7 @@ test "hooks: onRemove fires when component is removed" {
 test "hooks: onRemove fires on despawn" {
     hook_remove_count = 0;
 
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     world.onRemove(Health, onHealthRemoved);
@@ -283,7 +286,7 @@ test "hooks: onRemove fires on despawn" {
 // --- tags ---
 
 test "tags: zero-size components work as filters" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     _ = try world.spawn(.{ Position{ .x = 0, .y = 0 }, Player{} });
@@ -297,7 +300,7 @@ test "tags: zero-size components work as filters" {
 }
 
 test "tags: adding a tag to an existing entity" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const e = try world.spawn(.{Health{ .hp = 0 }});
@@ -322,7 +325,7 @@ const EnemyBundle = clutch.Bundle(.{
 });
 
 test "bundles: spawn with default bundle" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const p = try world.spawn(PlayerBundle.init());
@@ -334,7 +337,7 @@ test "bundles: spawn with default bundle" {
 }
 
 test "bundles: spawn with overridden values" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const p = try world.spawn(PlayerBundle.with(.{
@@ -349,7 +352,7 @@ test "bundles: spawn with overridden values" {
 }
 
 test "bundles: multiple bundle types" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     _ = try world.spawn(PlayerBundle.init());
@@ -371,7 +374,7 @@ test "bundles: multiple bundle types" {
 // --- world utils ---
 
 test "world: entityCount" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), world.entityCount());
@@ -388,7 +391,7 @@ test "world: entityCount" {
 }
 
 test "world: hasComponent" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const e = try world.spawn(.{ Position{ .x = 0, .y = 0 }, Health{ .hp = 100 } });
@@ -399,7 +402,7 @@ test "world: hasComponent" {
 }
 
 test "world: isAlive" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const e = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -410,7 +413,7 @@ test "world: isAlive" {
 }
 
 test "world: clear removes all entities but keeps resources" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     _ = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -424,7 +427,7 @@ test "world: clear removes all entities but keeps resources" {
 }
 
 test "world: entity id reuse after despawn" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const e1 = try world.spawn(.{Position{ .x = 0, .y = 0 }});
@@ -462,7 +465,7 @@ fn tickTimeSystem(time: clutch.ResMut(Time)) !void {
 }
 
 test "schedules: basic stage execution" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     try world.insertResource(Time{ .delta = 0.016, .elapsed = 0 });
@@ -487,7 +490,7 @@ test "schedules: basic stage execution" {
 }
 
 test "schedules: multiple stages run in order" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     try world.insertResource(Time{ .delta = 0.016, .elapsed = 0 });
@@ -512,7 +515,7 @@ test "schedules: multiple stages run in order" {
 }
 
 test "schedules: error in system halts chain" {
-    var world = clutch.World.init(std.heap.page_allocator);
+    var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
 
     const FailSystem = struct {

@@ -1,6 +1,6 @@
 # clutch
 
-clutch is an ecs system (named after a group of eggs) written in Zig. 
+clutch is an ecs system (named after a group of eggs) written in Zig, and inspired by bevy_ecs
 
 ## add to project
 requires zig `0.16.0`
