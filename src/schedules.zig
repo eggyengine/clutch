@@ -118,10 +118,47 @@ fn runSystem(world: *World, comptime system: anytype) !void {
 }
 
 fn runSystemWithArgs(world: *World, comptime system: anytype, comptime params: []const std.builtin.Type.Fn.Param) !void {
-    _ = params;
-    _ = world;
-    _ = system;
-    @compileError("systems with arguments are not supported yet");
+    switch (params.len) {
+        1 => try system(try systemArg(world, params[0].type.?)),
+        2 => try system(
+            try systemArg(world, params[0].type.?),
+            try systemArg(world, params[1].type.?),
+        ),
+        3 => try system(
+            try systemArg(world, params[0].type.?),
+            try systemArg(world, params[1].type.?),
+            try systemArg(world, params[2].type.?),
+        ),
+        4 => try system(
+            try systemArg(world, params[0].type.?),
+            try systemArg(world, params[1].type.?),
+            try systemArg(world, params[2].type.?),
+            try systemArg(world, params[3].type.?),
+        ),
+        else => @compileError("systems with more than 4 arguments are not supported yet"),
+    }
+}
+
+fn systemArg(world: *World, comptime Param: type) !Param {
+    switch (@typeInfo(Param)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => {
+            if (@hasDecl(Param, "is_query") and Param.is_query) {
+                return Param.init(world);
+            }
+        },
+        else => {},
+    }
+
+    switch (@typeInfo(Param)) {
+        .pointer => |pointer| {
+            if (pointer.size != .one) {
+                @compileError("system pointer arguments must be resources of type *T or *const T");
+            }
+
+            return world.getResource(pointer.child) orelse error.ResourceNotFound;
+        },
+        else => @compileError("system arguments must be Query(...), Res(T), or ResMut(T)"),
+    }
 }
 
 test "primary schedules run in lifecycle order" {

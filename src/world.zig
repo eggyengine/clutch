@@ -4,11 +4,16 @@ const root = @import("root.zig");
 const ErasedStorage = struct {
     ptr: *anyopaque,
     deinitFn: *const fn (*anyopaque, std.mem.Allocator) void,
+    hasEntityFn: *const fn (*anyopaque, root.EntityId) bool,
     removeEntityFn: *const fn (*anyopaque, root.EntityId) void,
     clearTrackingFn: *const fn (*anyopaque) void,
 
     fn deinit(self: ErasedStorage, allocator: std.mem.Allocator) void {
         self.deinitFn(self.ptr, allocator);
+    }
+
+    fn hasEntity(self: ErasedStorage, entity: root.EntityId) bool {
+        return self.hasEntityFn(self.ptr, entity);
     }
 
     fn removeEntity(self: ErasedStorage, entity: root.EntityId) void {
@@ -34,6 +39,15 @@ const ErasedEventStorage = struct {
     }
 };
 
+const ErasedResource = struct {
+    ptr: *anyopaque,
+    deinitFn: *const fn (*anyopaque, std.mem.Allocator) void,
+
+    fn deinit(self: ErasedResource, allocator: std.mem.Allocator) void {
+        self.deinitFn(self.ptr, allocator);
+    }
+};
+
 fn typeId(comptime T: type) u64 {
     return std.hash.Wyhash.hash(0, @typeName(T));
 }
@@ -43,6 +57,12 @@ fn deinitTypedStorage(comptime T: type, ptr: *anyopaque, allocator: std.mem.Allo
     const storage: *Storage = @ptrCast(@alignCast(ptr));
     storage.deinit(allocator);
     allocator.destroy(storage);
+}
+
+fn typedStorageHasEntity(comptime T: type, ptr: *anyopaque, entity: root.EntityId) bool {
+    const Storage = root.storage.ComponentStorage(T);
+    const storage: *Storage = @ptrCast(@alignCast(ptr));
+    return storage.has(entity);
 }
 
 fn removeEntityFromTypedStorage(comptime T: type, ptr: *anyopaque, entity: root.EntityId) void {
@@ -70,8 +90,15 @@ fn clearTypedEventStorage(comptime T: type, ptr: *anyopaque) void {
     storage.clearRetainingCapacity();
 }
 
+fn deinitTypedResource(comptime T: type, ptr: *anyopaque, allocator: std.mem.Allocator) void {
+    const resource: *T = @ptrCast(@alignCast(ptr));
+    allocator.destroy(resource);
+}
+
 /// Stores all components and entities using the ECS paradigm.
 pub const World = struct {
+    const HookFn = *const fn (*World, root.EntityId) void;
+
     const ErasedSchedule = struct {
         runFn: *const fn (*World) anyerror!void,
 
@@ -89,6 +116,9 @@ pub const World = struct {
 
     component_storages: std.AutoHashMap(u64, ErasedStorage),
     event_storages: std.AutoHashMap(u64, ErasedEventStorage),
+    resources: std.AutoHashMap(u64, ErasedResource),
+    on_add_hooks: std.AutoHashMap(u64, std.ArrayList(HookFn)),
+    on_remove_hooks: std.AutoHashMap(u64, std.ArrayList(HookFn)),
     schedules: std.AutoHashMap(u64, std.ArrayList(ErasedSchedule)),
     schedule_children: std.AutoHashMap(u64, std.ArrayList(u64)),
     parent_by_child: std.AutoHashMap(u32, root.EntityId),
@@ -103,6 +133,9 @@ pub const World = struct {
             .free_ids = .empty,
             .component_storages = std.AutoHashMap(u64, ErasedStorage).init(allocator),
             .event_storages = std.AutoHashMap(u64, ErasedEventStorage).init(allocator),
+            .resources = std.AutoHashMap(u64, ErasedResource).init(allocator),
+            .on_add_hooks = std.AutoHashMap(u64, std.ArrayList(HookFn)).init(allocator),
+            .on_remove_hooks = std.AutoHashMap(u64, std.ArrayList(HookFn)).init(allocator),
             .schedules = std.AutoHashMap(u64, std.ArrayList(ErasedSchedule)).init(allocator),
             .schedule_children = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
             .parent_by_child = std.AutoHashMap(u32, root.EntityId).init(allocator),
@@ -124,6 +157,18 @@ pub const World = struct {
         }
         self.schedule_children.deinit();
 
+        var add_hook_iter = self.on_add_hooks.valueIterator();
+        while (add_hook_iter.next()) |hooks| {
+            hooks.deinit(self.allocator);
+        }
+        self.on_add_hooks.deinit();
+
+        var remove_hook_iter = self.on_remove_hooks.valueIterator();
+        while (remove_hook_iter.next()) |hooks| {
+            hooks.deinit(self.allocator);
+        }
+        self.on_remove_hooks.deinit();
+
         var storage_iter = self.component_storages.valueIterator();
         while (storage_iter.next()) |storage| {
             storage.deinit(self.allocator);
@@ -135,6 +180,12 @@ pub const World = struct {
             storage.deinit(self.allocator);
         }
         self.event_storages.deinit();
+
+        var resource_iter = self.resources.valueIterator();
+        while (resource_iter.next()) |resource| {
+            resource.deinit(self.allocator);
+        }
+        self.resources.deinit();
 
         var children_iter = self.children_by_parent.valueIterator();
         while (children_iter.next()) |child_list| {
@@ -164,6 +215,11 @@ pub const World = struct {
             .deinitFn = struct {
                 fn run(ptr: *anyopaque, allocator: std.mem.Allocator) void {
                     deinitTypedStorage(T, ptr, allocator);
+                }
+            }.run,
+            .hasEntityFn = struct {
+                fn run(ptr: *anyopaque, entity: root.EntityId) bool {
+                    return typedStorageHasEntity(T, ptr, entity);
                 }
             }.run,
             .removeEntityFn = struct {
@@ -219,6 +275,36 @@ pub const World = struct {
         return @ptrCast(@alignCast(erased.ptr));
     }
 
+    /// Inserts or replaces a resource of the same type.
+    pub fn insertResource(self: *World, resource: anytype) !void {
+        const T = @TypeOf(resource);
+        const id = typeId(T);
+
+        if (self.resources.get(id)) |erased| {
+            const existing: *T = @ptrCast(@alignCast(erased.ptr));
+            existing.* = resource;
+            return;
+        }
+
+        const stored = try self.allocator.create(T);
+        stored.* = resource;
+
+        try self.resources.put(id, .{
+            .ptr = stored,
+            .deinitFn = struct {
+                fn run(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+                    deinitTypedResource(T, ptr, allocator);
+                }
+            }.run,
+        });
+    }
+
+    /// Returns a mutable pointer to a resource if one exists.
+    pub fn getResource(self: *World, comptime T: type) ?*T {
+        const erased = self.resources.get(typeId(T)) orelse return null;
+        return @ptrCast(@alignCast(erased.ptr));
+    }
+
     /// Initialises a new empty entity in the world.
     fn createEntity(self: *World) !root.EntityId {
         if (self.free_ids.items.len > 0) {
@@ -255,7 +341,11 @@ pub const World = struct {
 
         const T = @TypeOf(component);
         const storage = try self.storageFor(T);
+        const was_present = storage.has(entity);
         try storage.add(self.allocator, entity, component);
+        if (!was_present) {
+            self.runHooks(&self.on_add_hooks, typeId(T), entity);
+        }
     }
 
     /// Removes component(s) from an entity.
@@ -263,7 +353,41 @@ pub const World = struct {
         if (!self.isAlive(entity)) return error.EntityNotAlive;
 
         const storage = self.existingStorage(T) orelse return;
+        if (!storage.has(entity)) return;
+
+        self.runHooks(&self.on_remove_hooks, typeId(T), entity);
         storage.remove(entity);
+    }
+
+    /// Removes component(s) from an entity, ignoring missing or dead entities.
+    pub fn remove(self: *World, entity: root.EntityId, comptime T: type) void {
+        self.removeComponent(entity, T) catch {};
+    }
+
+    /// Registers a hook that runs when the component type is added to an entity.
+    pub fn onAdd(self: *World, comptime T: type, hook: HookFn) void {
+        self.addHook(&self.on_add_hooks, typeId(T), hook) catch @panic("failed to add onAdd hook");
+    }
+
+    /// Registers a hook that runs when the component type is removed from an entity.
+    pub fn onRemove(self: *World, comptime T: type, hook: HookFn) void {
+        self.addHook(&self.on_remove_hooks, typeId(T), hook) catch @panic("failed to add onRemove hook");
+    }
+
+    fn addHook(self: *World, hooks: *std.AutoHashMap(u64, std.ArrayList(HookFn)), component_id: u64, hook: HookFn) !void {
+        const entry = try hooks.getOrPut(component_id);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .empty;
+        }
+
+        try entry.value_ptr.append(self.allocator, hook);
+    }
+
+    fn runHooks(self: *World, hooks: *std.AutoHashMap(u64, std.ArrayList(HookFn)), component_id: u64, entity: root.EntityId) void {
+        const registered_hooks = hooks.getPtr(component_id) orelse return;
+        for (registered_hooks.items) |hook| {
+            hook(self, entity);
+        }
     }
 
     /// Returns whether the entity has the given component(s).
@@ -533,21 +657,35 @@ pub const World = struct {
             child_list.clearRetainingCapacity();
         }
 
+        var storage_iter = self.component_storages.iterator();
+        while (storage_iter.next()) |entry| {
+            if (!entry.value_ptr.hasEntity(entity)) continue;
+
+            self.runHooks(&self.on_remove_hooks, entry.key_ptr.*, entity);
+            entry.value_ptr.removeEntity(entity);
+        }
+
         const index = entity.index();
         self.alive.items[index] = false;
         self.generations.items[index] += 1;
         self.free_ids.append(self.allocator, entity.id) catch unreachable;
         self.living_count -= 1;
-
-        var storage_iter = self.component_storages.valueIterator();
-        while (storage_iter.next()) |storage| {
-            storage.removeEntity(entity);
-        }
     }
 
     /// Returns the number of living entities in the world.
     pub fn entityCount(self: *World) usize {
         return self.living_count;
+    }
+
+    /// Despawns all living entities while keeping resources and registered hooks/schedules.
+    pub fn clear(self: *World) void {
+        var index: usize = 0;
+        while (index < self.alive.items.len) : (index += 1) {
+            if (!self.alive.items[index]) continue;
+
+            const entity = root.EntityId.init(@intCast(index), self.generations.items[index]);
+            self.despawn(entity);
+        }
     }
 };
 
@@ -563,6 +701,8 @@ pub fn Query(comptime terms: anytype) type {
 
         world: *World,
         index: usize = 0,
+
+        pub const is_query = true;
 
         /// Represents a view into the world, providing access to one entity and its components.
         pub const View = struct {
@@ -830,6 +970,58 @@ test "world despawn removes components" {
 
     try std.testing.expect(!world.hasComponent(entity, Position));
     try std.testing.expect(world.get(entity, Position) == null);
+}
+
+test "world onAdd hook runs when component is added" {
+    const Health = struct { hp: f32 };
+    const State = struct {
+        var count: usize = 0;
+
+        fn onAdd(world: *World, entity: root.EntityId) void {
+            _ = world;
+            _ = entity;
+            count += 1;
+        }
+    };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    world.onAdd(Health, State.onAdd);
+
+    const first = try world.spawn(.{Health{ .hp = 50 }});
+    const second = try world.spawn(.{});
+    try world.addComponent(second, Health{ .hp = 80 });
+    try world.addComponent(first, Health{ .hp = 100 });
+
+    try std.testing.expectEqual(@as(usize, 2), State.count);
+}
+
+test "world onRemove hook runs when component is removed and despawned" {
+    const Health = struct { hp: f32 };
+    const Position = struct { x: f32, y: f32 };
+    const State = struct {
+        var count: usize = 0;
+
+        fn onRemove(world: *World, entity: root.EntityId) void {
+            _ = world;
+            _ = entity;
+            count += 1;
+        }
+    };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    world.onRemove(Health, State.onRemove);
+
+    const removed = try world.spawn(.{Health{ .hp = 100 }});
+    world.remove(removed, Health);
+
+    const despawned = try world.spawn(.{ Health{ .hp = 100 }, Position{ .x = 0, .y = 0 } });
+    world.despawn(despawned);
+
+    try std.testing.expectEqual(@as(usize, 2), State.count);
 }
 
 test "query accepts pointer component terms and filters" {

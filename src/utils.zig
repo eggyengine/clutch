@@ -1,3 +1,5 @@
+const std = @import("std");
+
 /// A bundle of components.
 ///
 /// # Example
@@ -22,13 +24,25 @@
 /// }
 /// ```
 pub fn Bundle(comptime defaults: anytype) type {
+    const Components = comptime blk: {
+        var types: [defaults.len]type = undefined;
+        for (defaults, 0..) |default, index| {
+            types[index] = @TypeOf(default);
+        }
+        break :blk std.meta.Tuple(&types);
+    };
+
     return struct {
-        pub fn init() @TypeOf(defaults) {
-            return defaults;
+        pub fn init() Components {
+            var result: Components = undefined;
+            inline for (defaults, 0..) |default, index| {
+                result[index] = default;
+            }
+            return result;
         }
 
-        pub fn with(overrides: anytype) @TypeOf(defaults) {
-            var result = defaults;
+        pub fn with(overrides: anytype) Components {
+            var result = init();
             inline for (defaults, 0..) |default, index| {
                 inline for (overrides) |override| {
                     if (@TypeOf(default) == @TypeOf(override)) {
