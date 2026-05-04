@@ -5,6 +5,7 @@ const ErasedStorage = struct {
     ptr: *anyopaque,
     deinitFn: *const fn (*anyopaque, std.mem.Allocator) void,
     removeEntityFn: *const fn (*anyopaque, root.EntityId) void,
+    clearTrackingFn: *const fn (*anyopaque) void,
 
     fn deinit(self: ErasedStorage, allocator: std.mem.Allocator) void {
         self.deinitFn(self.ptr, allocator);
@@ -12,6 +13,24 @@ const ErasedStorage = struct {
 
     fn removeEntity(self: ErasedStorage, entity: root.EntityId) void {
         self.removeEntityFn(self.ptr, entity);
+    }
+
+    fn clearTracking(self: ErasedStorage) void {
+        self.clearTrackingFn(self.ptr);
+    }
+};
+
+const ErasedEventStorage = struct {
+    ptr: *anyopaque,
+    deinitFn: *const fn (*anyopaque, std.mem.Allocator) void,
+    clearFn: *const fn (*anyopaque) void,
+
+    fn deinit(self: ErasedEventStorage, allocator: std.mem.Allocator) void {
+        self.deinitFn(self.ptr, allocator);
+    }
+
+    fn clear(self: ErasedEventStorage) void {
+        self.clearFn(self.ptr);
     }
 };
 
@@ -32,6 +51,25 @@ fn removeEntityFromTypedStorage(comptime T: type, ptr: *anyopaque, entity: root.
     storage.remove(entity);
 }
 
+fn clearTypedStorageTracking(comptime T: type, ptr: *anyopaque) void {
+    const Storage = root.storage.ComponentStorage(T);
+    const storage: *Storage = @ptrCast(@alignCast(ptr));
+    storage.clearTracking();
+}
+
+fn deinitTypedEventStorage(comptime T: type, ptr: *anyopaque, allocator: std.mem.Allocator) void {
+    const EventStorage = std.ArrayList(T);
+    const storage: *EventStorage = @ptrCast(@alignCast(ptr));
+    storage.deinit(allocator);
+    allocator.destroy(storage);
+}
+
+fn clearTypedEventStorage(comptime T: type, ptr: *anyopaque) void {
+    const EventStorage = std.ArrayList(T);
+    const storage: *EventStorage = @ptrCast(@alignCast(ptr));
+    storage.clearRetainingCapacity();
+}
+
 /// Stores all components and entities using the ECS paradigm.
 pub const World = struct {
     allocator: std.mem.Allocator,
@@ -42,6 +80,7 @@ pub const World = struct {
     living_count: usize = 0,
 
     component_storages: std.AutoHashMap(u64, ErasedStorage),
+    event_storages: std.AutoHashMap(u64, ErasedEventStorage),
 
     /// Creates a new World with the given allocator.
     pub fn init(allocator: std.mem.Allocator) World {
@@ -51,6 +90,7 @@ pub const World = struct {
             .alive = .empty,
             .free_ids = .empty,
             .component_storages = std.AutoHashMap(u64, ErasedStorage).init(allocator),
+            .event_storages = std.AutoHashMap(u64, ErasedEventStorage).init(allocator),
         };
     }
 
@@ -61,6 +101,12 @@ pub const World = struct {
             storage.deinit(self.allocator);
         }
         self.component_storages.deinit();
+
+        var event_iter = self.event_storages.valueIterator();
+        while (event_iter.next()) |storage| {
+            storage.deinit(self.allocator);
+        }
+        self.event_storages.deinit();
 
         self.generations.deinit(self.allocator);
         self.alive.deinit(self.allocator);
@@ -90,9 +136,47 @@ pub const World = struct {
                     removeEntityFromTypedStorage(T, ptr, entity);
                 }
             }.run,
+            .clearTrackingFn = struct {
+                fn run(ptr: *anyopaque) void {
+                    clearTypedStorageTracking(T, ptr);
+                }
+            }.run,
         });
 
         return storage;
+    }
+
+    fn eventStorageFor(self: *World, comptime T: type) !*std.ArrayList(T) {
+        const EventStorage = std.ArrayList(T);
+        const id = typeId(T);
+
+        if (self.event_storages.get(id)) |erased| {
+            return @ptrCast(@alignCast(erased.ptr));
+        }
+
+        const storage = try self.allocator.create(EventStorage);
+        storage.* = .empty;
+
+        try self.event_storages.put(id, .{
+            .ptr = storage,
+            .deinitFn = struct {
+                fn run(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+                    deinitTypedEventStorage(T, ptr, allocator);
+                }
+            }.run,
+            .clearFn = struct {
+                fn run(ptr: *anyopaque) void {
+                    clearTypedEventStorage(T, ptr);
+                }
+            }.run,
+        });
+
+        return storage;
+    }
+
+    fn existingEventStorage(self: *World, comptime T: type) ?*std.ArrayList(T) {
+        const erased = self.event_storages.get(typeId(T)) orelse return null;
+        return @ptrCast(@alignCast(erased.ptr));
     }
 
     fn existingStorage(self: *World, comptime T: type) ?*root.storage.ComponentStorage(T) {
@@ -119,6 +203,8 @@ pub const World = struct {
     }
 
     /// Spawns a new entity with the given components.
+    ///
+    /// Components can also be an empty struct if you wish to spawn a blank entity.
     pub fn spawn(self: *World, components: anytype) !root.EntityId {
         const entity = try self.createEntity();
         inline for (components) |component| {
@@ -153,6 +239,7 @@ pub const World = struct {
         return storage.has(entity);
     }
 
+    /// Fetches a mutable pointer to **a** component
     pub fn get(self: *World, entity: root.EntityId, comptime T: type) ?*T {
         if (!self.isAlive(entity)) return null;
 
@@ -160,6 +247,65 @@ pub const World = struct {
         return storage.get(entity);
     }
 
+    /// Set the type to be changed for an entity.
+    pub fn markChanged(self: *World, entity: root.EntityId, comptime T: type) void {
+        if (!self.isAlive(entity)) return;
+
+        const storage = self.existingStorage(T) orelse return;
+        storage.markChanged(entity) catch unreachable;
+    }
+
+    /// Was a type recently added to an entity?
+    pub fn wasAdded(self: *World, entity: root.EntityId, comptime T: type) bool {
+        if (!self.isAlive(entity)) return false;
+
+        const storage = self.existingStorage(T) orelse return false;
+        return storage.wasAdded(entity);
+    }
+
+    /// Was a component's data mutated for an entity?
+    pub fn wasChanged(self: *World, entity: root.EntityId, comptime T: type) bool {
+        if (!self.isAlive(entity)) return false;
+
+        const storage = self.existingStorage(T) orelse return false;
+        return storage.wasChanged(entity);
+    }
+
+    /// Was a component removed from an entity?
+    pub fn wasRemoved(self: *World, entity: root.EntityId, comptime T: type) bool {
+        if (!self.isAlive(entity)) return false;
+
+        const storage = self.existingStorage(T) orelse return false;
+        return storage.wasRemoved(entity);
+    }
+
+    /// Ticks and iterates through modifications, allowing for filters such as
+    /// `Changed(T)` and `Added(T)` to be available.
+    pub fn tick(self: *World) void {
+        var storage_iter = self.component_storages.valueIterator();
+        while (storage_iter.next()) |storage| {
+            storage.clearTracking();
+        }
+
+        var event_iter = self.event_storages.valueIterator();
+        while (event_iter.next()) |storage| {
+            storage.clear();
+        }
+    }
+
+    /// Sends/emits a signal for an event (as specified by a specific type)
+    pub fn sendEvent(self: *World, event: anytype) !void {
+        const T = @TypeOf(event);
+        const storage = try self.eventStorageFor(T);
+        try storage.append(self.allocator, event);
+    }
+
+    /// Returns an `EventReader` for the types specfied
+    pub fn eventReader(self: *World, comptime T: type) EventReader(T) {
+        return EventReader(T).init(self);
+    }
+
+    /// Create a `Query` with the terms (an anonymous struct of types)
     pub fn query(self: *World, comptime terms: anytype) Query(terms) {
         return Query(terms).init(self);
     }
@@ -196,9 +342,11 @@ pub const World = struct {
 
 /// A query requests components for entities from the world.
 ///
-/// Create one with `world.query(.{Position, Health})` or even add filters with
-/// `world.query(.{Position, Health, With(Position)})`
+/// Create one with `world.query(.{ *Position, *const Health })` or even add filters with
+/// `world.query(.{ *Position, With(Player) })`.
 pub fn Query(comptime terms: anytype) type {
+    comptime validateQueryTerms(terms);
+
     return struct {
         const Self = @This();
 
@@ -212,9 +360,15 @@ pub fn Query(comptime terms: anytype) type {
             /// Represents the current entity in the existing view
             entity: root.EntityId,
 
-            /// Returns a pointer to the component of type `T` for this entity.
-            pub fn get(self: View, comptime T: type) *T {
-                return self.world.get(self.entity, T).?;
+            /// Returns a pointer to the component requested by `*T` or `*const T`.
+            pub fn get(self: View, comptime Ptr: type) Ptr {
+                comptime {
+                    if (!isQueryPointerTerm(Ptr)) {
+                        @compileError("View.get expects *T or *const T");
+                    }
+                }
+
+                return self.world.get(self.entity, queryComponentType(Ptr)).?;
             }
         };
 
@@ -254,12 +408,74 @@ pub fn Query(comptime terms: anytype) type {
                     if (!world.hasComponent(entity, term.component)) return false;
                 } else if (comptime root.filters.isWithout(term)) {
                     if (world.hasComponent(entity, term.component)) return false;
+                } else if (comptime root.filters.isAdded(term)) {
+                    if (!world.wasAdded(entity, term.component)) return false;
+                } else if (comptime root.filters.isChanged(term)) {
+                    if (!world.wasChanged(entity, term.component)) return false;
+                } else if (comptime root.filters.isRemoved(term)) {
+                    if (!world.wasRemoved(entity, term.component)) return false;
                 } else {
-                    if (!world.hasComponent(entity, term)) return false;
+                    if (!world.hasComponent(entity, queryComponentType(term))) return false;
                 }
             }
 
             return true;
+        }
+    };
+}
+
+fn validateQueryTerms(comptime terms: anytype) void {
+    inline for (terms) |term| {
+        if (comptime isFilterTerm(term)) continue;
+        if (comptime isQueryPointerTerm(term)) continue;
+
+        @compileError("Query terms must be *T, *const T, or a filter such as With(T), Without(T), Added(T), Changed(T), or Removed(T)");
+    }
+}
+
+fn isFilterTerm(comptime term: type) bool {
+    return root.filters.isWith(term) or
+        root.filters.isWithout(term) or
+        root.filters.isAdded(term) or
+        root.filters.isChanged(term) or
+        root.filters.isRemoved(term);
+}
+
+fn isQueryPointerTerm(comptime term: type) bool {
+    return switch (@typeInfo(term)) {
+        .pointer => |pointer| pointer.size == .one,
+        else => false,
+    };
+}
+
+fn queryComponentType(comptime term: type) type {
+    return switch (@typeInfo(term)) {
+        .pointer => |pointer| pointer.child,
+        else => @compileError("expected a query pointer term"),
+    };
+}
+
+pub fn EventReader(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        events: ?*std.ArrayList(T),
+        index: usize = 0,
+
+        pub fn init(world: *World) Self {
+            return .{
+                .events = world.existingEventStorage(T),
+                .index = 0,
+            };
+        }
+
+        pub fn next(self: *Self) ?*const T {
+            const events = self.events orelse return null;
+            if (self.index >= events.items.len) return null;
+
+            const event = &events.items[self.index];
+            self.index += 1;
+            return event;
         }
     };
 }
@@ -360,4 +576,53 @@ test "world despawn removes components" {
 
     try std.testing.expect(!world.hasComponent(entity, Position));
     try std.testing.expect(world.get(entity, Position) == null);
+}
+
+test "query accepts pointer component terms and filters" {
+    const Position = struct { x: f32, y: f32 };
+    const Velocity = struct { dx: f32, dy: f32 };
+    const Player = struct {};
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const player = try world.spawn(.{
+        Position{ .x = 1, .y = 2 },
+        Velocity{ .dx = 3, .dy = 4 },
+        Player{},
+    });
+    _ = try world.spawn(.{Position{ .x = 5, .y = 6 }});
+
+    var query = world.query(.{ *const Position, *Velocity, root.filters.With(Player) });
+    const view = query.next().?;
+
+    try std.testing.expectEqual(player, view.entity);
+    try std.testing.expectEqual(@as(f32, 1), view.get(*const Position).x);
+
+    const velocity = view.get(*Velocity);
+    velocity.dx = 8;
+    try std.testing.expectEqual(@as(f32, 8), world.get(player, Velocity).?.dx);
+    try std.testing.expect(query.next() == null);
+}
+
+test "query matches removed component filters for the current tick" {
+    const Health = struct { hp: f32 };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const entity = try world.spawn(.{Health{ .hp = 100 }});
+    world.tick();
+
+    try world.removeComponent(entity, Health);
+
+    var removed = world.query(.{root.filters.Removed(Health)});
+    const view = removed.next().?;
+    try std.testing.expectEqual(entity, view.entity);
+    try std.testing.expect(removed.next() == null);
+
+    world.tick();
+
+    var cleared = world.query(.{root.filters.Removed(Health)});
+    try std.testing.expect(cleared.next() == null);
 }

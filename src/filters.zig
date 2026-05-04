@@ -8,6 +8,7 @@ pub const FilterKind = enum {
     without,
     added,
     changed,
+    removed,
 };
 
 // --- With ---
@@ -32,10 +33,10 @@ pub const FilterKind = enum {
 /// _ = enemy;
 ///
 /// // Queries the Position component that also contains the Player component
-/// var query = world.query(.{ Position, clutch.With(Player) });
+/// var query = world.query(.{ *const Position, clutch.With(Player) });
 /// var count: usize = 0;
 /// while (query.next()) |view| {
-///     const pos = view.get(Position);
+///     const pos = view.get(*const Position);
 ///     try std.testing.expectEqual(player, view.entity);
 ///     try std.testing.expectApproxEqAbs(@as(f32, 0), pos.x, 0.001);
 ///     count += 1;
@@ -50,7 +51,7 @@ pub fn With(comptime T: type) type {
 }
 
 pub fn isWith(comptime Term: type) bool {
-    return @hasDecl(Term, "kind") and Term.kind == .with;
+    return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .with;
 }
 
 test "isWith filter works" {
@@ -73,7 +74,7 @@ test "isWith filter works" {
 /// _ = try world.spawn(.{ Position{ .x = 2, .y = 2 }, Enemy{} });
 ///
 /// // Query for entities with Position but not Enemy
-/// var query = world.query(.{ Position, clutch.Without(Enemy) });
+/// var query = world.query(.{ *const Position, clutch.Without(Enemy) });
 /// var count: usize = 0;
 /// while (query.next()) |_| count += 1;
 /// // Only one entity is returned
@@ -87,7 +88,7 @@ pub fn Without(comptime T: type) type {
 }
 
 pub fn isWithout(comptime Term: type) bool {
-    return @hasDecl(Term, "kind") and Term.kind == .without;
+    return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .without;
 }
 
 test "isWithout filter works" {
@@ -130,7 +131,7 @@ pub fn Added(comptime T: type) type {
 }
 
 pub fn isAdded(comptime Term: type) bool {
-    return @hasDecl(Term, "kind") and Term.kind == .added;
+    return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .added;
 }
 
 test "isAdded filter works" {
@@ -176,11 +177,41 @@ pub fn Changed(comptime T: type) type {
 }
 
 pub fn isChanged(comptime Term: type) bool {
-    return @hasDecl(Term, "kind") and Term.kind == .changed;
+    return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .changed;
+}
+
+// --- Removed ---
+
+/// A filter that requires the component `T` to have been removed during the current tick.
+///
+/// This is useful for systems that should react when a component is detached from a living
+/// entity.
+pub fn Removed(comptime T: type) type {
+    return struct {
+        pub const kind: FilterKind = .removed;
+        pub const component = T;
+    };
+}
+
+pub fn isRemoved(comptime Term: type) bool {
+    return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .removed;
+}
+
+fn isFilterStruct(comptime Term: type) bool {
+    return switch (@typeInfo(Term)) {
+        .@"struct" => true,
+        else => false,
+    };
 }
 
 test "isChanged filter works" {
     const Position = struct {};
     const filter = Changed(Position);
     try std.testing.expect(isChanged(filter));
+}
+
+test "isRemoved filter works" {
+    const Health = struct {};
+    const filter = Removed(Health);
+    try std.testing.expect(isRemoved(filter));
 }

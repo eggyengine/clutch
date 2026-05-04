@@ -19,6 +19,34 @@ const Gravity = struct { y: f32 };
 const CollisionEvent = struct { a: clutch.EntityId, b: clutch.EntityId };
 const DamageEvent = struct { target: clutch.EntityId, amount: f32 };
 
+test "basics" {
+    var world = clutch.World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const launch_angle: f32 = std.math.pi / 4.0;
+    const player = try world.spawn(.{
+        Position{ .x = 0, .y = 0 },
+        Gravity{ .y = -9.81 },
+        Velocity{ .dx = 10 * @cos(launch_angle), .dy = 10 * @sin(launch_angle) },
+        Player{},
+    });
+
+    var query = world.query(.{ *Position, *Velocity, *const Gravity });
+    while (query.next()) |view| {
+        const pos = view.get(*Position);
+        const vel = view.get(*Velocity);
+        const gravity = view.get(*const Gravity);
+
+        vel.dy += gravity.y;
+        pos.x += vel.dx;
+        pos.y += vel.dy;
+    }
+
+    const pos = world.get(player, Position).?;
+    try std.testing.expect(pos.x > 0);
+    try std.testing.expect(pos.y < 0);
+}
+
 // --- filters ---
 
 test "filter: With" {
@@ -37,10 +65,10 @@ test "filter: With" {
     });
     _ = enemy;
 
-    var query = world.query(.{Position}, .{clutch.With(Player)});
+    var query = world.query(.{ *const Position, clutch.With(Player) });
     var count: usize = 0;
     while (query.next()) |view| {
-        const pos = view.get(Position);
+        const pos = view.get(*const Position);
         try std.testing.expectEqual(player, view.entity);
         try std.testing.expectApproxEqAbs(@as(f32, 0), pos.x, 0.001);
         count += 1;
@@ -56,12 +84,13 @@ test "filter: Without" {
     _ = try world.spawn(.{ Position{ .x = 1, .y = 1 }, Enemy{} });
     _ = try world.spawn(.{ Position{ .x = 2, .y = 2 }, Enemy{} });
 
-    var query = world.query(.{ Position, clutch.Without(Enemy) });
+    var query = world.query(.{ *const Position, clutch.Without(Enemy) });
     var count: usize = 0;
     while (query.next()) |_| count += 1;
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
+// tbh i feel like added and changed filters are unnecessary
 test "filter: Added" {
     var world = clutch.World.init(std.testing.allocator);
     defer world.deinit();
@@ -170,7 +199,7 @@ test "hierarchy: set and get parent" {
     const parent = try world.spawn(.{Position{ .x = 0, .y = 0 }});
     const child = try world.spawn(.{Position{ .x = 1, .y = 0 }});
 
-    try world.setParent(child, parent);
+    try world.setParent(parent, .{child});
 
     const retrieved = world.getParent(child) orelse return error.NoParent;
     try std.testing.expectEqual(parent, retrieved);
@@ -293,7 +322,7 @@ test "tags: zero-size components work as filters" {
     _ = try world.spawn(.{ Position{ .x = 1, .y = 1 }, Enemy{} });
     _ = try world.spawn(.{ Position{ .x = 2, .y = 2 }, Enemy{}, Dead{} });
 
-    var living_enemies = world.query(.{ Position, clutch.With(Enemy), clutch.Without(Dead) });
+    var living_enemies = world.query(.{ *const Position, clutch.With(Enemy), clutch.Without(Dead) });
     var count: usize = 0;
     while (living_enemies.next()) |_| count += 1;
     try std.testing.expectEqual(@as(usize, 1), count);
@@ -440,12 +469,12 @@ test "world: entity id reuse after despawn" {
 
 // --- schedules ---
 
-fn movementSystem(query: clutch.Query(.{ *Position, Velocity }), time: clutch.Res(Time)) !void {
+fn movementSystem(query: clutch.Query(.{ *Position, *const Velocity }), time: clutch.Res(Time)) !void {
     var q = query;
     const dt = time.delta;
     while (q.next()) |view| {
-        const pos = view.get(Position);
-        const vel = view.get(Velocity);
+        const pos = view.get(*Position);
+        const vel = view.get(*const Velocity);
         pos.x += vel.dx * dt;
         pos.y += vel.dy * dt;
     }
@@ -455,7 +484,7 @@ fn gravitySystem(query: clutch.Query(.{*Velocity}), gravity: clutch.Res(Gravity)
     var q = query;
     const g = gravity.y;
     while (q.next()) |view| {
-        const vel = view.get(Velocity);
+        const vel = view.get(*Velocity);
         vel.dy += g * 0.016;
     }
 }

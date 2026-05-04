@@ -13,12 +13,18 @@ pub fn ComponentStorage(comptime T: type) type {
         entities: std.ArrayList(entity_mod.EntityId),
         values: std.ArrayList(T),
         indices: std.AutoHashMap(u32, usize),
+        added: std.AutoHashMap(u32, void),
+        changed: std.AutoHashMap(u32, void),
+        removed: std.AutoHashMap(u32, void),
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .entities = .empty,
                 .values = .empty,
                 .indices = std.AutoHashMap(u32, usize).init(allocator),
+                .added = std.AutoHashMap(u32, void).init(allocator),
+                .changed = std.AutoHashMap(u32, void).init(allocator),
+                .removed = std.AutoHashMap(u32, void).init(allocator),
             };
         }
 
@@ -26,12 +32,16 @@ pub fn ComponentStorage(comptime T: type) type {
             self.entities.deinit(allocator);
             self.values.deinit(allocator);
             self.indices.deinit();
+            self.added.deinit();
+            self.changed.deinit();
+            self.removed.deinit();
         }
 
         /// Add a value for the given entity, or update the existing value if one already exists.
         pub fn add(self: *Self, allocator: std.mem.Allocator, entity: entity_mod.EntityId, value: T) !void {
             if (self.indices.get(entity.id)) |index| {
                 self.values.items[index] = value;
+                try self.changed.put(entity.id, {});
                 return;
             }
 
@@ -39,6 +49,8 @@ pub fn ComponentStorage(comptime T: type) type {
             try self.entities.append(allocator, entity);
             try self.values.append(allocator, value);
             try self.indices.put(entity.id, index);
+            try self.added.put(entity.id, {});
+            _ = self.removed.remove(entity.id);
         }
 
         /// Get a pointer to the value for the given entity, or null if the entity does not have a value.
@@ -68,6 +80,32 @@ pub fn ComponentStorage(comptime T: type) type {
             _ = self.values.pop();
             _ = self.entities.pop();
             _ = self.indices.remove(entity.id);
+            _ = self.added.remove(entity.id);
+            _ = self.changed.remove(entity.id);
+            self.removed.put(entity.id, {}) catch unreachable;
+        }
+
+        pub fn markChanged(self: *Self, entity: entity_mod.EntityId) !void {
+            if (!self.has(entity)) return;
+            try self.changed.put(entity.id, {});
+        }
+
+        pub fn wasAdded(self: *Self, entity: entity_mod.EntityId) bool {
+            return self.added.contains(entity.id);
+        }
+
+        pub fn wasChanged(self: *Self, entity: entity_mod.EntityId) bool {
+            return self.changed.contains(entity.id);
+        }
+
+        pub fn wasRemoved(self: *Self, entity: entity_mod.EntityId) bool {
+            return self.removed.contains(entity.id);
+        }
+
+        pub fn clearTracking(self: *Self) void {
+            self.added.clearRetainingCapacity();
+            self.changed.clearRetainingCapacity();
+            self.removed.clearRetainingCapacity();
         }
     };
 }
