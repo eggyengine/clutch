@@ -56,6 +56,7 @@ pub const ScheduleStage = struct {
 
 pub const Stage = ScheduleStage;
 
+/// Converts all valid schedule values to a `ScheduleStage`.
 pub fn stage(comptime value: anytype) ScheduleStage {
     const T = @TypeOf(value);
 
@@ -120,7 +121,10 @@ fn runSystem(world: *World, comptime system: anytype) !void {
 
 fn runSystemWithArgs(world: *World, comptime system: anytype, comptime params: []const std.builtin.Type.Fn.Param) !void {
     const needs_commands = comptime systemHasCommandsParam(params);
-    var command_buffer = if (needs_commands) command.CommandBuffer.init(world.allocator) else undefined;
+    var command_buffer: command.CommandBuffer = undefined;
+    if (needs_commands) {
+        command_buffer = command.CommandBuffer.init(world.allocator);
+    }
     defer if (needs_commands) command_buffer.deinit();
 
     const ArgTypes = comptime blk: {

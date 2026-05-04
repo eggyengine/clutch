@@ -1,3 +1,6 @@
+const std = @import("std");
+const examples = @import("example.zig"); // do not make this public, only for tests
+
 // file imports
 pub const world = @import("world.zig");
 pub const entity = @import("entity.zig");
@@ -14,7 +17,6 @@ pub const Query = world.Query;
 pub const EventReader = world.EventReader;
 pub const EntityId = entity.EntityId;
 
-// filters
 pub const With = filters.With;
 pub const Without = filters.Without;
 pub const Added = filters.Added;
@@ -33,3 +35,8 @@ pub const stage = schedules.stage;
 pub const Bundle = utils.Bundle;
 pub const CommandBuffer = command.CommandBuffer;
 pub const Commands = command.Commands;
+
+test { // idk if this even works
+    std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(examples);
+}
