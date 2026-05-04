@@ -1,5 +1,9 @@
 const std = @import("std");
-const World = @import("world.zig").World;
+const world_mod = @import("world.zig");
+const EntityId = @import("entity.zig").EntityId;
+const Query = world_mod.Query;
+const World = world_mod.World;
+const command = @import("command.zig");
 
 pub const Stages = enum(u8) {
     PreInit,
@@ -66,7 +70,7 @@ pub fn stage(comptime value: anytype) ScheduleStage {
 
     switch (@typeInfo(T)) {
         .@"enum" => return ScheduleStage.primary(value),
-        .@"enum_literal" => return ScheduleStage.primary(@field(Stages, @tagName(value))),
+        .enum_literal => return ScheduleStage.primary(@field(Stages, @tagName(value))),
         .pointer => |pointer| {
             if (pointer.size == .slice and pointer.child == u8) {
                 return ScheduleStage.custom(value);
@@ -109,37 +113,41 @@ pub fn Schedule(comptime schedule_stage: anytype, comptime systems: anytype) typ
 
 fn runSystem(world: *World, comptime system: anytype) !void {
     const info = @typeInfo(@TypeOf(system)).@"fn";
-    if (info.params.len == 0) {
-        try system();
-        return;
-    }
+    comptime validateSystemAccess(info.params);
 
     try runSystemWithArgs(world, system, info.params);
 }
 
 fn runSystemWithArgs(world: *World, comptime system: anytype, comptime params: []const std.builtin.Type.Fn.Param) !void {
-    switch (params.len) {
-        1 => try system(try systemArg(world, params[0].type.?)),
-        2 => try system(
-            try systemArg(world, params[0].type.?),
-            try systemArg(world, params[1].type.?),
-        ),
-        3 => try system(
-            try systemArg(world, params[0].type.?),
-            try systemArg(world, params[1].type.?),
-            try systemArg(world, params[2].type.?),
-        ),
-        4 => try system(
-            try systemArg(world, params[0].type.?),
-            try systemArg(world, params[1].type.?),
-            try systemArg(world, params[2].type.?),
-            try systemArg(world, params[3].type.?),
-        ),
-        else => @compileError("systems with more than 4 arguments are not supported yet"),
+    const needs_commands = comptime systemHasCommandsParam(params);
+    var command_buffer = if (needs_commands) command.CommandBuffer.init(world.allocator) else undefined;
+    defer if (needs_commands) command_buffer.deinit();
+
+    const ArgTypes = comptime blk: {
+        var types: [params.len]type = undefined;
+        for (params, 0..) |param, i| {
+            types[i] = param.type orelse @compileError("system arguments must have concrete types");
+        }
+        break :blk types;
+    };
+
+    var args: std.meta.Tuple(&ArgTypes) = undefined;
+    inline for (params, 0..) |param, i| {
+        args[i] = try systemArg(world, if (needs_commands) &command_buffer else null, param.type.?);
+    }
+
+    try @call(.auto, system, args);
+
+    if (needs_commands) {
+        try command_buffer.apply(world);
     }
 }
 
-fn systemArg(world: *World, comptime Param: type) !Param {
+fn systemArg(world: *World, command_buffer: ?*command.CommandBuffer, comptime Param: type) !Param {
+    if (comptime isCommandsParam(Param)) {
+        return command.Commands.init(command_buffer.?);
+    }
+
     switch (@typeInfo(Param)) {
         .@"struct", .@"enum", .@"union", .@"opaque" => {
             if (@hasDecl(Param, "is_query") and Param.is_query) {
@@ -157,8 +165,119 @@ fn systemArg(world: *World, comptime Param: type) !Param {
 
             return world.getResource(pointer.child) orelse error.ResourceNotFound;
         },
-        else => @compileError("system arguments must be Query(...), Res(T), or ResMut(T)"),
+        else => @compileError("system arguments must be Query(...), Res(T), ResMut(T), or Commands"),
     }
+}
+
+fn systemHasCommandsParam(comptime params: []const std.builtin.Type.Fn.Param) bool {
+    for (params) |param| {
+        if (isCommandsParam(param.type.?)) return true;
+    }
+    return false;
+}
+
+fn isCommandsParam(comptime Param: type) bool {
+    return switch (@typeInfo(Param)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(Param, "is_commands") and Param.is_commands,
+        else => false,
+    };
+}
+
+fn validateSystemAccess(comptime params: []const std.builtin.Type.Fn.Param) void {
+    inline for (params, 0..) |left, left_index| {
+        const Left = left.type.?;
+        validateParamSelfAccess(Left);
+
+        inline for (params[0..left_index]) |right| {
+            validateParamPairAccess(Left, right.type.?);
+        }
+    }
+}
+
+fn validateParamSelfAccess(comptime Param: type) void {
+    if (!isQueryType(Param)) return;
+
+    inline for (Param.query_terms, 0..) |left, left_index| {
+        inline for (Param.query_terms, 0..) |right, right_index| {
+            if (right_index < left_index) {
+                validateQueryTermPairAccess(left, right);
+            }
+        }
+    }
+}
+
+fn validateParamPairAccess(comptime Left: type, comptime Right: type) void {
+    if (comptime isQueryType(Left) and isQueryType(Right)) {
+        inline for (Left.query_terms) |left_term| {
+            inline for (Right.query_terms) |right_term| {
+                validateQueryTermPairAccess(left_term, right_term);
+            }
+        }
+        return;
+    }
+
+    if (comptime isResourceParam(Left) and isResourceParam(Right)) {
+        validateResourcePairAccess(Left, Right);
+    }
+}
+
+fn validateQueryTermPairAccess(comptime Left: type, comptime Right: type) void {
+    if (!isQueryPointerTerm(Left) or !isQueryPointerTerm(Right)) return;
+
+    const LeftComponent = queryComponentType(Left);
+    const RightComponent = queryComponentType(Right);
+    if (LeftComponent != RightComponent) return;
+    if (isConstPointer(Left) and isConstPointer(Right)) return;
+
+    @compileError("system has conflicting query access to component `" ++ @typeName(LeftComponent) ++ "`");
+}
+
+fn validateResourcePairAccess(comptime Left: type, comptime Right: type) void {
+    const LeftResource = pointerChild(Left);
+    const RightResource = pointerChild(Right);
+    if (LeftResource != RightResource) return;
+    if (isConstPointer(Left) and isConstPointer(Right)) return;
+
+    @compileError("system has conflicting resource access to `" ++ @typeName(LeftResource) ++ "`");
+}
+
+fn isQueryType(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(T, "is_query") and T.is_query,
+        else => false,
+    };
+}
+
+fn isResourceParam(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| pointer.size == .one,
+        else => false,
+    };
+}
+
+fn isQueryPointerTerm(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| pointer.size == .one,
+        else => false,
+    };
+}
+
+fn queryComponentType(comptime T: type) type {
+    return pointerChild(T);
+}
+
+fn pointerChild(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| pointer.child,
+        else => @compileError("expected pointer type"),
+    };
+}
+
+fn isConstPointer(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| pointer.is_const,
+        else => false,
+    };
 }
 
 test "primary schedules run in lifecycle order" {
@@ -277,4 +396,63 @@ test "custom schedule label attaches after primary parent" {
     try world.runAll();
 
     try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, &State.order);
+}
+
+test "systems support more than four arguments" {
+    const A = struct { value: u8 };
+    const B = struct { value: u8 };
+    const C = struct { value: u8 };
+    const D = struct { value: u8 };
+    const E = struct { value: u8 };
+
+    const State = struct {
+        var sum: u8 = 0;
+
+        fn update(a: *const A, b: *const B, c: *const C, d: *const D, e: *const E) !void {
+            sum = a.value + b.value + c.value + d.value + e.value;
+        }
+    };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    try world.insertResource(A{ .value = 1 });
+    try world.insertResource(B{ .value = 2 });
+    try world.insertResource(C{ .value = 3 });
+    try world.insertResource(D{ .value = 4 });
+    try world.insertResource(E{ .value = 5 });
+
+    world.addSchedule(Schedule(.Update, .{State.update}));
+    try world.runStage(.Update);
+
+    try std.testing.expectEqual(15, State.sum);
+}
+
+test "systems can defer mutations with commands" {
+    const Position = struct { x: i32, y: i32 };
+    const Velocity = struct { x: i32, y: i32 };
+
+    const State = struct {
+        var entity: EntityId = undefined;
+
+        fn update(commands: command.Commands, query: Query(.{*const Position})) !void {
+            var iter = query;
+            const view = iter.next().?;
+            entity = view.entity;
+
+            try commands.addComponent(view.entity, Velocity{ .x = 1, .y = 2 });
+            try std.testing.expect(view.world.get(view.entity, Velocity) == null);
+        }
+    };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const entity = try world.spawn(.{Position{ .x = 3, .y = 4 }});
+
+    world.addSchedule(Schedule(.Update, .{State.update}));
+    try world.runStage(.Update);
+
+    try std.testing.expect(EntityId.eql(entity, State.entity));
+    try std.testing.expect(world.hasComponent(entity, Velocity));
 }

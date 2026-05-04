@@ -96,6 +96,8 @@ fn deinitTypedResource(comptime T: type, ptr: *anyopaque, allocator: std.mem.All
 }
 
 /// Stores all components and entities using the ECS paradigm.
+///
+/// Typically should not be received as an argument in a system. Use `clutch.Command` instead.
 pub const World = struct {
     const HookFn = *const fn (*World, root.EntityId) void;
 
@@ -703,6 +705,7 @@ pub fn Query(comptime terms: anytype) type {
         index: usize = 0,
 
         pub const is_query = true;
+        pub const query_terms = terms;
 
         /// Represents a view into the world, providing access to one entity and its components.
         pub const View = struct {
@@ -855,7 +858,7 @@ pub const ChildrenIterator = struct {
     items: []const root.EntityId,
     index: usize = 0,
 
-    /// Iterates to the next entity. 
+    /// Iterates to the next entity.
     /// # Examples
     /// ```zig
     /// var iter = world.children(parent);

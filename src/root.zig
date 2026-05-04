@@ -1,16 +1,17 @@
 // file imports
-pub const w = @import("world.zig");
+pub const world = @import("world.zig");
 pub const entity = @import("entity.zig");
 pub const storage = @import("storage.zig");
 pub const filters = @import("filters.zig");
 pub const resources = @import("resources.zig");
 pub const schedules = @import("schedules.zig");
 pub const utils = @import("utils.zig");
+pub const command = @import("command.zig");
 
 // type imports
-pub const World = w.World;
-pub const Query = w.Query;
-pub const EventReader = w.EventReader;
+pub const World = world.World;
+pub const Query = world.Query;
+pub const EventReader = world.EventReader;
 pub const EntityId = entity.EntityId;
 
 // filters
@@ -30,3 +31,5 @@ pub const Schedule = schedules.Schedule;
 pub const stage = schedules.stage;
 
 pub const Bundle = utils.Bundle;
+pub const CommandBuffer = command.CommandBuffer;
+pub const Commands = command.Commands;
