@@ -72,6 +72,14 @@ fn clearTypedEventStorage(comptime T: type, ptr: *anyopaque) void {
 
 /// Stores all components and entities using the ECS paradigm.
 pub const World = struct {
+    const ErasedSchedule = struct {
+        runFn: *const fn (*World) anyerror!void,
+
+        fn run(self: ErasedSchedule, world: *World) !void {
+            try self.runFn(world);
+        }
+    };
+
     allocator: std.mem.Allocator,
 
     generations: std.ArrayList(u32),
@@ -81,6 +89,8 @@ pub const World = struct {
 
     component_storages: std.AutoHashMap(u64, ErasedStorage),
     event_storages: std.AutoHashMap(u64, ErasedEventStorage),
+    schedules: std.AutoHashMap(u64, std.ArrayList(ErasedSchedule)),
+    schedule_children: std.AutoHashMap(u64, std.ArrayList(u64)),
     parent_by_child: std.AutoHashMap(u32, root.EntityId),
     children_by_parent: std.AutoHashMap(u32, std.ArrayList(root.EntityId)),
 
@@ -93,6 +103,8 @@ pub const World = struct {
             .free_ids = .empty,
             .component_storages = std.AutoHashMap(u64, ErasedStorage).init(allocator),
             .event_storages = std.AutoHashMap(u64, ErasedEventStorage).init(allocator),
+            .schedules = std.AutoHashMap(u64, std.ArrayList(ErasedSchedule)).init(allocator),
+            .schedule_children = std.AutoHashMap(u64, std.ArrayList(u64)).init(allocator),
             .parent_by_child = std.AutoHashMap(u32, root.EntityId).init(allocator),
             .children_by_parent = std.AutoHashMap(u32, std.ArrayList(root.EntityId)).init(allocator),
         };
@@ -100,6 +112,18 @@ pub const World = struct {
 
     /// Frees all resources associated with the world.
     pub fn deinit(self: *World) void {
+        var schedule_iter = self.schedules.valueIterator();
+        while (schedule_iter.next()) |schedules| {
+            schedules.deinit(self.allocator);
+        }
+        self.schedules.deinit();
+
+        var schedule_child_iter = self.schedule_children.valueIterator();
+        while (schedule_child_iter.next()) |child_stages| {
+            child_stages.deinit(self.allocator);
+        }
+        self.schedule_children.deinit();
+
         var storage_iter = self.component_storages.valueIterator();
         while (storage_iter.next()) |storage| {
             storage.deinit(self.allocator);
@@ -319,6 +343,79 @@ pub const World = struct {
     /// Create a `Query` with the terms (an anonymous struct of types)
     pub fn query(self: *World, comptime terms: anytype) Query(terms) {
         return Query(terms).init(self);
+    }
+
+    /// Adds a schedule to its declared stage.
+    pub fn addSchedule(self: *World, comptime ScheduleType: type) void {
+        self.addScheduleFallible(ScheduleType) catch @panic("failed to add schedule");
+    }
+
+    /// Adds a schedule to its declared stage, returning allocation errors to the caller.
+    pub fn addScheduleFallible(self: *World, comptime ScheduleType: type) !void {
+        const schedule_stage = ScheduleType.stage_value;
+        const entry = try self.schedules.getOrPut(schedule_stage.id);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .empty;
+        }
+
+        try entry.value_ptr.append(self.allocator, .{
+            .runFn = struct {
+                fn run(world: *World) !void {
+                    try ScheduleType.run(world);
+                }
+            }.run,
+        });
+
+        if (schedule_stage.parent_id) |parent_id| {
+            try self.addScheduleChild(parent_id, schedule_stage.id);
+        }
+    }
+
+    /// Runs all schedules registered for the stage.
+    pub fn runStage(self: *World, comptime stage_value: anytype) !void {
+        const id = scheduleId(stage_value);
+        try self.runStageById(id);
+    }
+
+    fn runStageById(self: *World, id: u64) !void {
+        if (self.schedules.getPtr(id)) |schedules_for_stage| {
+            for (schedules_for_stage.items) |registered| {
+                try registered.run(self);
+            }
+        }
+
+        const child_stages = self.schedule_children.getPtr(id) orelse return;
+        for (child_stages.items) |child_id| {
+            try self.runStageById(child_id);
+        }
+    }
+
+    /// Runs primary schedules in their built-in order.
+    pub fn runAll(self: *World) !void {
+        inline for (root.schedules.primary_order) |primary_stage| {
+            try self.runStageById(scheduleId(primary_stage));
+        }
+    }
+
+    fn addScheduleChild(self: *World, parent_id: u64, child_id: u64) !void {
+        const entry = try self.schedule_children.getOrPut(parent_id);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .empty;
+        }
+
+        for (entry.value_ptr.items) |existing_child_id| {
+            if (existing_child_id == child_id) return;
+        }
+
+        try entry.value_ptr.append(self.allocator, child_id);
+    }
+
+    fn scheduleId(comptime stage_value: anytype) u64 {
+        const T = @TypeOf(stage_value);
+        if (T == root.schedules.ScheduleStage) return stage_value.id;
+        if (T == root.Stages) return root.schedules.Stage.primary(stage_value).id;
+
+        return root.schedules.stage(stage_value).id;
     }
 
     /// Sets a parent/child relationship.

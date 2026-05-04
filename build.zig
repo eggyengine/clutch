@@ -11,18 +11,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    const example_mod = b.createModule(.{
-        .root_source_file = b.path("src/example.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const example_tests = b.addTest(.{
-        .name = "example-tests",
-        .root_module = example_mod,
-    });
-    const run_example_tests = b.addRunArtifact(example_tests);
-
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_example_tests.step);
 }

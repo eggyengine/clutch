@@ -469,9 +469,11 @@ test "world: entity id reuse after despawn" {
 
 // --- schedules ---
 
+// sample of creating custom schedule
 pub const AfterUpdatingButBeforeRendering = struct {
     const Self = @This();
 
+    // must be required
     pub fn schedule() clutch.ScheduleStage {
         return clutch.ScheduleStage(.{
             clutch.Stages.PostUpdate,

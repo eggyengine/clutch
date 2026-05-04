@@ -24,6 +24,9 @@ pub const Res = resources.Res;
 pub const ResMut = resources.ResMut;
 
 pub const Stages = schedules.Stages;
+pub const Stage = schedules.Stage;
+pub const ScheduleStage = schedules.ScheduleStage;
 pub const Schedule = schedules.Schedule;
+pub const stage = schedules.stage;
 
 pub const Bundle = utils.Bundle;
