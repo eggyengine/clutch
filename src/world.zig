@@ -81,6 +81,8 @@ pub const World = struct {
 
     component_storages: std.AutoHashMap(u64, ErasedStorage),
     event_storages: std.AutoHashMap(u64, ErasedEventStorage),
+    parent_by_child: std.AutoHashMap(u32, root.EntityId),
+    children_by_parent: std.AutoHashMap(u32, std.ArrayList(root.EntityId)),
 
     /// Creates a new World with the given allocator.
     pub fn init(allocator: std.mem.Allocator) World {
@@ -91,6 +93,8 @@ pub const World = struct {
             .free_ids = .empty,
             .component_storages = std.AutoHashMap(u64, ErasedStorage).init(allocator),
             .event_storages = std.AutoHashMap(u64, ErasedEventStorage).init(allocator),
+            .parent_by_child = std.AutoHashMap(u32, root.EntityId).init(allocator),
+            .children_by_parent = std.AutoHashMap(u32, std.ArrayList(root.EntityId)).init(allocator),
         };
     }
 
@@ -107,6 +111,13 @@ pub const World = struct {
             storage.deinit(self.allocator);
         }
         self.event_storages.deinit();
+
+        var children_iter = self.children_by_parent.valueIterator();
+        while (children_iter.next()) |child_list| {
+            child_list.deinit(self.allocator);
+        }
+        self.children_by_parent.deinit();
+        self.parent_by_child.deinit();
 
         self.generations.deinit(self.allocator);
         self.alive.deinit(self.allocator);
@@ -310,6 +321,101 @@ pub const World = struct {
         return Query(terms).init(self);
     }
 
+    /// Sets a parent/child relationship.
+    ///
+    /// Accepts either `setParent(child, parent)` or `setParent(parent, .{ child1, child2 })`.
+    pub fn setParent(self: *World, first: root.EntityId, second: anytype) !void {
+        if (comptime @TypeOf(second) == root.EntityId) {
+            try self.setSingleParent(first, second);
+            return;
+        }
+
+        inline for (second) |child| {
+            try self.setSingleParent(child, first);
+        }
+    }
+
+    fn setSingleParent(self: *World, child: root.EntityId, parent: root.EntityId) !void {
+        if (!self.isAlive(child) or !self.isAlive(parent)) return error.EntityNotAlive;
+        if (root.EntityId.eql(child, parent)) return error.InvalidHierarchy;
+        if (self.isDescendantOf(parent, child)) return error.InvalidHierarchy;
+
+        self.removeParent(child);
+
+        try self.parent_by_child.put(child.id, parent);
+
+        const entry = try self.children_by_parent.getOrPut(parent.id);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .empty;
+        }
+        try entry.value_ptr.append(self.allocator, child);
+    }
+
+    fn isDescendantOf(self: *World, entity: root.EntityId, possible_parent: root.EntityId) bool {
+        var current = self.getParent(entity);
+        while (current) |parent| {
+            if (root.EntityId.eql(parent, possible_parent)) return true;
+            current = self.getParent(parent);
+        }
+        return false;
+    }
+
+    /// Fetches the parent of an entity if one is set.
+    pub fn getParent(self: *World, child: root.EntityId) ?root.EntityId {
+        if (!self.isAlive(child)) return null;
+        const parent = self.parent_by_child.get(child.id) orelse return null;
+        if (!self.isAlive(parent)) return null;
+        return parent;
+    }
+
+    /// Removed the parent if one is set, or just simply returns.
+    pub fn removeParent(self: *World, child: root.EntityId) void {
+        const parent = self.parent_by_child.get(child.id) orelse return;
+        _ = self.parent_by_child.remove(child.id);
+
+        const child_list = self.children_by_parent.getPtr(parent.id) orelse return;
+        var index: usize = 0;
+        while (index < child_list.items.len) : (index += 1) {
+            if (root.EntityId.eql(child_list.items[index], child)) {
+                _ = child_list.swapRemove(index);
+                break;
+            }
+        }
+    }
+
+    /// Returns an iterator (`ChildrenIterator`) containing all items.
+    pub fn children(self: *World, parent: root.EntityId) ChildrenIterator {
+        return .{
+            .world = self,
+            .items = if (self.children_by_parent.getPtr(parent.id)) |list| list.items else &.{},
+        };
+    }
+
+    /// Recursively despawn entities and their children
+    pub fn despawnRecursive(self: *World, entity: root.EntityId) void {
+        if (!self.isAlive(entity)) return;
+
+        while (true) {
+            const child = blk: {
+                const child_list = self.children_by_parent.getPtr(entity.id) orelse break;
+                if (child_list.items.len == 0) break;
+
+                const current_child = child_list.items[child_list.items.len - 1];
+                if (!self.isAlive(current_child)) {
+                    _ = child_list.pop();
+                    _ = self.parent_by_child.remove(current_child.id);
+                    continue;
+                }
+
+                break :blk current_child;
+            };
+
+            self.despawnRecursive(child);
+        }
+
+        self.despawn(entity);
+    }
+
     /// Checks the generation validity of an entity and ensures that the latest generation matches the entity's generation.
     pub fn isAlive(self: *World, entity: root.EntityId) bool {
         if (entity.id >= self.alive.items.len) return false;
@@ -321,6 +427,14 @@ pub const World = struct {
     /// Despawns an entity, marking it as dead and freeing its ID for reuse.
     pub fn despawn(self: *World, entity: root.EntityId) void {
         if (!self.isAlive(entity)) return;
+
+        self.removeParent(entity);
+        if (self.children_by_parent.getPtr(entity.id)) |child_list| {
+            for (child_list.items) |child| {
+                _ = self.parent_by_child.remove(child.id);
+            }
+            child_list.clearRetainingCapacity();
+        }
 
         const index = entity.index();
         self.alive.items[index] = false;
@@ -455,6 +569,9 @@ fn queryComponentType(comptime term: type) type {
     };
 }
 
+/// An event reader allows for checking if any events have occured during the tick.
+///
+/// The event provided is provided with `T`.
 pub fn EventReader(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -462,6 +579,9 @@ pub fn EventReader(comptime T: type) type {
         events: ?*std.ArrayList(T),
         index: usize = 0,
 
+        /// Initialises the event reader for the world.
+        ///
+        /// Typically done through `world.eventReader(T);`
         pub fn init(world: *World) Self {
             return .{
                 .events = world.existingEventStorage(T),
@@ -469,6 +589,18 @@ pub fn EventReader(comptime T: type) type {
             };
         }
 
+        /// Iterates through all events queried by the event reader.
+        ///
+        /// # Examples
+        /// ```zig
+        /// try world.sendEvent(DamageEvent{ .target = e, .amount = 25 });
+        /// try world.sendEvent(DamageEvent{ .target = e, .amount = 10 });
+        ///
+        /// var reader = world.eventReader(DamageEvent);
+        /// while (reader.next()) |ev| {
+        ///     // ev is *const DamageEvent
+        /// }
+        /// ```
         pub fn next(self: *Self) ?*const T {
             const events = self.events orelse return null;
             if (self.index >= events.items.len) return null;
@@ -479,6 +611,31 @@ pub fn EventReader(comptime T: type) type {
         }
     };
 }
+
+/// Iterates over the direct children of a parent entity.
+pub const ChildrenIterator = struct {
+    world: *World,
+    items: []const root.EntityId,
+    index: usize = 0,
+
+    /// Iterates to the next entity. 
+    /// # Examples
+    /// ```zig
+    /// var iter = world.children(parent);
+    /// while (iter.next()) |child| {
+    ///     // child is clutch.EntityId
+    /// }
+    /// ```
+    pub fn next(self: *ChildrenIterator) ?root.EntityId {
+        while (self.index < self.items.len) {
+            const child = self.items[self.index];
+            self.index += 1;
+            if (self.world.isAlive(child)) return child;
+        }
+
+        return null;
+    }
+};
 
 test "world creates living entities" {
     var world = World.init(std.testing.allocator);
@@ -625,4 +782,57 @@ test "query matches removed component filters for the current tick" {
 
     var cleared = world.query(.{root.filters.Removed(Health)});
     try std.testing.expect(cleared.next() == null);
+}
+
+test "world hierarchy stores parent and iterates children" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const parent = try world.spawn(.{});
+    const first = try world.spawn(.{});
+    const second = try world.spawn(.{});
+
+    try world.setParent(parent, .{ first, second });
+
+    try std.testing.expectEqual(parent, world.getParent(first).?);
+    try std.testing.expectEqual(parent, world.getParent(second).?);
+
+    var children = world.children(parent);
+    var count: usize = 0;
+    while (children.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "world hierarchy despawns recursively" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const parent = try world.spawn(.{});
+    const child = try world.spawn(.{});
+    const grandchild = try world.spawn(.{});
+
+    try world.setParent(child, parent);
+    try world.setParent(grandchild, child);
+
+    world.despawnRecursive(parent);
+
+    try std.testing.expect(!world.isAlive(parent));
+    try std.testing.expect(!world.isAlive(child));
+    try std.testing.expect(!world.isAlive(grandchild));
+    try std.testing.expectEqual(@as(usize, 0), world.entityCount());
+}
+
+test "world hierarchy removes parent links" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const parent = try world.spawn(.{});
+    const child = try world.spawn(.{});
+
+    try world.setParent(child, parent);
+    world.removeParent(child);
+
+    try std.testing.expect(world.getParent(child) == null);
+    var children = world.children(parent);
+    try std.testing.expect(children.next() == null);
 }

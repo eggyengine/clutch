@@ -469,6 +469,17 @@ test "world: entity id reuse after despawn" {
 
 // --- schedules ---
 
+pub const AfterUpdatingButBeforeRendering = struct {
+    const Self = @This();
+
+    pub fn schedule() clutch.ScheduleStage {
+        return clutch.ScheduleStage(.{
+            clutch.Stages.PostUpdate,
+            Self,
+        });
+    }
+};
+
 fn movementSystem(query: clutch.Query(.{ *Position, *const Velocity }), time: clutch.Res(Time)) !void {
     var q = query;
     const dt = time.delta;
