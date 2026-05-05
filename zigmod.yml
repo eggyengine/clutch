@@ -1,0 +1,8 @@
+id: ppcj0qkjffrfkk33jtmsvbk0o2cmram6w8hmm4kgcqk8nflu
+name: clutch
+main: src/root.zig
+license: MIT
+description: A ECS system written in zig for the eggyengine
+min_zig_version: 0.14.0
+min_zigmod_version: r96
+dependencies:
