@@ -2,51 +2,50 @@ const std = @import("std");
 const EntityId = @import("entity.zig").EntityId;
 const World = @import("world.zig").World;
 
+/// One queued command: where its payload starts in `CommandBuffer.payloads`, and how to apply it.
 const Command = struct {
-    ptr: *anyopaque,
-    applyFn: *const fn (*anyopaque, *World) anyerror!void,
-    deinitFn: *const fn (*anyopaque, std.mem.Allocator) void,
-
-    fn apply(self: Command, world: *World) !void {
-        try self.applyFn(self.ptr, world);
-    }
-
-    fn deinit(self: Command, allocator: std.mem.Allocator) void {
-        self.deinitFn(self.ptr, allocator);
-    }
+    offset: usize,
+    applyFn: *const fn ([*]const u8, *World) anyerror!void,
 };
 
 /// A deferred queue of world mutations.
 ///
-/// Commands are applied in insertion order when `apply` is called. Payload memory is
-/// owned by the buffer and released by `apply`, `clearRetainingCapacity`, or `deinit`.
+/// Commands are applied in insertion order when `apply` is called. As in Bevy, each command's
+/// payload is copied into one byte buffer and read back out unaligned when applied, so queuing
+/// allocates only when the buffers grow; `apply` and `clearRetainingCapacity` keep that memory.
 pub const CommandBuffer = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
     commands: std.ArrayList(Command) = .empty,
+    payloads: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Self) void {
-        self.clearRetainingCapacity();
         self.commands.deinit(self.allocator);
+        self.payloads.deinit(self.allocator);
+    }
+
+    pub fn isEmpty(self: *const Self) bool {
+        return self.commands.items.len == 0;
     }
 
     pub fn clearRetainingCapacity(self: *Self) void {
-        for (self.commands.items) |command| {
-            command.deinit(self.allocator);
-        }
         self.commands.clearRetainingCapacity();
+        self.payloads.clearRetainingCapacity();
     }
 
     pub fn apply(self: *Self, world: *World) !void {
         defer self.clearRetainingCapacity();
 
-        for (self.commands.items) |command| {
-            try command.apply(world);
+        // By index, re-reading both lists: a command may queue more while it applies.
+        var index: usize = 0;
+        while (index < self.commands.items.len) : (index += 1) {
+            const command = self.commands.items[index];
+            try command.applyFn(self.payloads.items.ptr + command.offset, world);
         }
     }
 
@@ -55,8 +54,7 @@ pub const CommandBuffer = struct {
         try self.queue(struct {
             components: Components,
 
-            fn apply(ptr: *anyopaque, world: *World) !void {
-                const payload: *@This() = @ptrCast(@alignCast(ptr));
+            fn apply(payload: @This(), world: *World) !void {
                 _ = try world.spawn(payload.components);
             }
         }{ .components = components });
@@ -67,8 +65,7 @@ pub const CommandBuffer = struct {
         try self.queue(struct {
             resource: Resource,
 
-            fn apply(ptr: *anyopaque, world: *World) !void {
-                const payload: *@This() = @ptrCast(@alignCast(ptr));
+            fn apply(payload: @This(), world: *World) !void {
                 try world.insertResource(payload.resource);
             }
         }{ .resource = resource });
@@ -80,8 +77,7 @@ pub const CommandBuffer = struct {
             entity: EntityId,
             component: Component,
 
-            fn apply(ptr: *anyopaque, world: *World) !void {
-                const payload: *@This() = @ptrCast(@alignCast(ptr));
+            fn apply(payload: @This(), world: *World) !void {
                 try world.addComponent(payload.entity, payload.component);
             }
         }{ .entity = entity, .component = component });
@@ -91,8 +87,7 @@ pub const CommandBuffer = struct {
         try self.queue(struct {
             entity: EntityId,
 
-            fn apply(ptr: *anyopaque, world: *World) !void {
-                const payload: *@This() = @ptrCast(@alignCast(ptr));
+            fn apply(payload: @This(), world: *World) !void {
                 try world.removeComponent(payload.entity, T);
             }
         }{ .entity = entity });
@@ -106,8 +101,7 @@ pub const CommandBuffer = struct {
         try self.queue(struct {
             entity: EntityId,
 
-            fn apply(ptr: *anyopaque, world: *World) !void {
-                const payload: *@This() = @ptrCast(@alignCast(ptr));
+            fn apply(payload: @This(), world: *World) !void {
                 world.despawn(payload.entity);
             }
         }{ .entity = entity });
@@ -117,8 +111,7 @@ pub const CommandBuffer = struct {
         try self.queue(struct {
             entity: EntityId,
 
-            fn apply(ptr: *anyopaque, world: *World) !void {
-                const payload: *@This() = @ptrCast(@alignCast(ptr));
+            fn apply(payload: @This(), world: *World) !void {
                 world.despawnRecursive(payload.entity);
             }
         }{ .entity = entity });
@@ -129,8 +122,7 @@ pub const CommandBuffer = struct {
         try self.queue(struct {
             event: Event,
 
-            fn apply(ptr: *anyopaque, world: *World) !void {
-                const payload: *@This() = @ptrCast(@alignCast(ptr));
+            fn apply(payload: @This(), world: *World) !void {
                 try world.sendEvent(payload.event);
             }
         }{ .event = event });
@@ -142,8 +134,7 @@ pub const CommandBuffer = struct {
             first: EntityId,
             second: Second,
 
-            fn apply(ptr: *anyopaque, world: *World) !void {
-                const payload: *@This() = @ptrCast(@alignCast(ptr));
+            fn apply(payload: @This(), world: *World) !void {
                 try world.setParent(payload.first, payload.second);
             }
         }{ .first = first, .second = second });
@@ -153,8 +144,7 @@ pub const CommandBuffer = struct {
         try self.queue(struct {
             child: EntityId,
 
-            fn apply(ptr: *anyopaque, world: *World) !void {
-                const payload: *@This() = @ptrCast(@alignCast(ptr));
+            fn apply(payload: @This(), world: *World) !void {
                 world.removeParent(payload.child);
             }
         }{ .child = child });
@@ -162,17 +152,16 @@ pub const CommandBuffer = struct {
 
     fn queue(self: *Self, payload: anytype) !void {
         const Payload = @TypeOf(payload);
-        const stored = try self.allocator.create(Payload);
-        stored.* = payload;
-        errdefer self.allocator.destroy(stored);
-
-        try self.commands.append(self.allocator, .{
-            .ptr = stored,
-            .applyFn = Payload.apply,
-            .deinitFn = struct {
-                fn run(ptr: *anyopaque, allocator: std.mem.Allocator) void {
-                    const typed: *Payload = @ptrCast(@alignCast(ptr));
-                    allocator.destroy(typed);
+        try self.commands.ensureUnusedCapacity(self.allocator, 1);
+        const offset = self.payloads.items.len;
+        try self.payloads.appendSlice(self.allocator, std.mem.asBytes(&payload));
+        self.commands.appendAssumeCapacity(.{
+            .offset = offset,
+            .applyFn = struct {
+                fn run(bytes: [*]const u8, world: *World) !void {
+                    // Unaligned: payloads are packed back to back.
+                    const copy = std.mem.bytesToValue(Payload, bytes[0..@sizeOf(Payload)]);
+                    try copy.apply(world);
                 }
             }.run,
         });

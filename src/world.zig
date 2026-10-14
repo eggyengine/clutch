@@ -1,12 +1,13 @@
 const std = @import("std");
 const root = @import("root.zig");
 
+const Tick = root.storage.Tick;
+
 const ErasedStorage = struct {
     ptr: *anyopaque,
     deinitFn: *const fn (*anyopaque, std.mem.Allocator) void,
     hasEntityFn: *const fn (*anyopaque, root.EntityId) bool,
-    removeEntityFn: *const fn (*anyopaque, root.EntityId) void,
-    clearTrackingFn: *const fn (*anyopaque) void,
+    removeEntityFn: *const fn (*anyopaque, root.EntityId, Tick) void,
 
     fn deinit(self: ErasedStorage, allocator: std.mem.Allocator) void {
         self.deinitFn(self.ptr, allocator);
@@ -16,12 +17,8 @@ const ErasedStorage = struct {
         return self.hasEntityFn(self.ptr, entity);
     }
 
-    fn removeEntity(self: ErasedStorage, entity: root.EntityId) void {
-        self.removeEntityFn(self.ptr, entity);
-    }
-
-    fn clearTracking(self: ErasedStorage) void {
-        self.clearTrackingFn(self.ptr);
+    fn removeEntity(self: ErasedStorage, entity: root.EntityId, tick: Tick) void {
+        self.removeEntityFn(self.ptr, entity, tick);
     }
 };
 
@@ -49,7 +46,27 @@ const ErasedResource = struct {
 };
 
 fn typeId(comptime T: type) u64 {
-    return std.hash.Wyhash.hash(0, @typeName(T));
+    return comptime std.hash.Wyhash.hash(0, @typeName(T));
+}
+
+/// Next free component type index; see `typeIndex`.
+var next_type_index = std.atomic.Value(u32).init(0);
+const unassigned_type_index = std.math.maxInt(u32);
+
+/// A small number for component type `T`, the same in every world: the position of its
+/// storage in `World.component_storages`, so finding a storage is an array read, not a hash.
+/// Assigned on first use; safe to call from several threads.
+fn typeIndex(comptime T: type) u32 {
+    const Slot = struct {
+        const Component = T; // one `Slot` per component type
+        var index = std.atomic.Value(u32).init(unassigned_type_index);
+    };
+    _ = Slot.Component;
+    const known = Slot.index.load(.acquire);
+    if (known != unassigned_type_index) return known;
+    const fresh = next_type_index.fetchAdd(1, .monotonic);
+    // Another thread may have assigned one meanwhile; theirs wins and `fresh` goes unused.
+    return Slot.index.cmpxchgStrong(unassigned_type_index, fresh, .acq_rel, .acquire) orelse fresh;
 }
 
 fn deinitTypedStorage(comptime T: type, ptr: *anyopaque, allocator: std.mem.Allocator) void {
@@ -65,16 +82,10 @@ fn typedStorageHasEntity(comptime T: type, ptr: *anyopaque, entity: root.EntityI
     return storage.has(entity);
 }
 
-fn removeEntityFromTypedStorage(comptime T: type, ptr: *anyopaque, entity: root.EntityId) void {
+fn removeEntityFromTypedStorage(comptime T: type, ptr: *anyopaque, entity: root.EntityId, tick: Tick) void {
     const Storage = root.storage.ComponentStorage(T);
     const storage: *Storage = @ptrCast(@alignCast(ptr));
-    storage.remove(entity);
-}
-
-fn clearTypedStorageTracking(comptime T: type, ptr: *anyopaque) void {
-    const Storage = root.storage.ComponentStorage(T);
-    const storage: *Storage = @ptrCast(@alignCast(ptr));
-    storage.clearTracking();
+    storage.remove(entity, tick);
 }
 
 fn deinitTypedEventStorage(comptime T: type, ptr: *anyopaque, allocator: std.mem.Allocator) void {
@@ -115,8 +126,15 @@ pub const World = struct {
     alive: std.ArrayList(bool),
     free_ids: std.ArrayList(u32),
     living_count: usize = 0,
+    /// The current change tick: `Added`, `Changed` and `Removed` match what happened during it.
+    /// Starts at 1 (0 means "never") and advances with `tick`.
+    change_tick: Tick = 1,
 
-    component_storages: std.AutoHashMap(u64, ErasedStorage),
+    /// Reused by every system that takes `Commands`, so running one allocates nothing.
+    system_commands: root.CommandBuffer,
+
+    /// Indexed by `typeIndex`; null for component types this world hasn't stored yet.
+    component_storages: std.ArrayList(?ErasedStorage),
     event_storages: std.AutoHashMap(u64, ErasedEventStorage),
     resources: std.AutoHashMap(u64, ErasedResource),
     on_add_hooks: std.AutoHashMap(u64, std.ArrayList(HookFn)),
@@ -133,7 +151,8 @@ pub const World = struct {
             .generations = .empty,
             .alive = .empty,
             .free_ids = .empty,
-            .component_storages = std.AutoHashMap(u64, ErasedStorage).init(allocator),
+            .component_storages = .empty,
+            .system_commands = .init(allocator),
             .event_storages = std.AutoHashMap(u64, ErasedEventStorage).init(allocator),
             .resources = std.AutoHashMap(u64, ErasedResource).init(allocator),
             .on_add_hooks = std.AutoHashMap(u64, std.ArrayList(HookFn)).init(allocator),
@@ -171,11 +190,10 @@ pub const World = struct {
         }
         self.on_remove_hooks.deinit();
 
-        var storage_iter = self.component_storages.valueIterator();
-        while (storage_iter.next()) |storage| {
-            storage.deinit(self.allocator);
+        for (self.component_storages.items) |maybe_storage| {
+            if (maybe_storage) |storage| storage.deinit(self.allocator);
         }
-        self.component_storages.deinit();
+        self.component_storages.deinit(self.allocator);
 
         var event_iter = self.event_storages.valueIterator();
         while (event_iter.next()) |storage| {
@@ -196,6 +214,7 @@ pub const World = struct {
         self.children_by_parent.deinit();
         self.parent_by_child.deinit();
 
+        self.system_commands.deinit();
         self.generations.deinit(self.allocator);
         self.alive.deinit(self.allocator);
         self.free_ids.deinit(self.allocator);
@@ -203,16 +222,16 @@ pub const World = struct {
 
     fn storageFor(self: *World, comptime T: type) !*root.storage.ComponentStorage(T) {
         const Storage = root.storage.ComponentStorage(T);
-        const id = typeId(T);
+        if (self.existingStorage(T)) |storage| return storage;
 
-        if (self.component_storages.get(id)) |erased| {
-            return @ptrCast(@alignCast(erased.ptr));
+        const index = typeIndex(T);
+        if (index >= self.component_storages.items.len) {
+            try self.component_storages.appendNTimes(self.allocator, null, index + 1 - self.component_storages.items.len);
         }
-
         const storage = try self.allocator.create(Storage);
         storage.* = Storage.init(self.allocator);
 
-        try self.component_storages.put(id, .{
+        self.component_storages.items[index] = (ErasedStorage{
             .ptr = storage,
             .deinitFn = struct {
                 fn run(ptr: *anyopaque, allocator: std.mem.Allocator) void {
@@ -225,13 +244,8 @@ pub const World = struct {
                 }
             }.run,
             .removeEntityFn = struct {
-                fn run(ptr: *anyopaque, entity: root.EntityId) void {
-                    removeEntityFromTypedStorage(T, ptr, entity);
-                }
-            }.run,
-            .clearTrackingFn = struct {
-                fn run(ptr: *anyopaque) void {
-                    clearTypedStorageTracking(T, ptr);
+                fn run(ptr: *anyopaque, entity: root.EntityId, at: Tick) void {
+                    removeEntityFromTypedStorage(T, ptr, entity, at);
                 }
             }.run,
         });
@@ -273,7 +287,9 @@ pub const World = struct {
     }
 
     fn existingStorage(self: *World, comptime T: type) ?*root.storage.ComponentStorage(T) {
-        const erased = self.component_storages.get(typeId(T)) orelse return null;
+        const index = typeIndex(T);
+        if (index >= self.component_storages.items.len) return null;
+        const erased = self.component_storages.items[index] orelse return null;
         return @ptrCast(@alignCast(erased.ptr));
     }
 
@@ -343,10 +359,8 @@ pub const World = struct {
 
         const T = @TypeOf(component);
         const storage = try self.storageFor(T);
-        const was_present = storage.has(entity);
-        try storage.add(self.allocator, entity, component);
-        if (!was_present) {
-            self.runHooks(&self.on_add_hooks, typeId(T), entity);
+        if (try storage.insert(self.allocator, entity, component, self.change_tick)) {
+            self.runHooks(&self.on_add_hooks, typeIndex(T), entity);
         }
     }
 
@@ -357,8 +371,8 @@ pub const World = struct {
         const storage = self.existingStorage(T) orelse return;
         if (!storage.has(entity)) return;
 
-        self.runHooks(&self.on_remove_hooks, typeId(T), entity);
-        storage.remove(entity);
+        self.runHooks(&self.on_remove_hooks, typeIndex(T), entity);
+        storage.remove(entity, self.change_tick);
     }
 
     /// Removes component(s) from an entity, ignoring missing or dead entities.
@@ -368,12 +382,12 @@ pub const World = struct {
 
     /// Registers a hook that runs when the component type is added to an entity.
     pub fn onAdd(self: *World, comptime T: type, hook: HookFn) void {
-        self.addHook(&self.on_add_hooks, typeId(T), hook) catch @panic("failed to add onAdd hook");
+        self.addHook(&self.on_add_hooks, typeIndex(T), hook) catch @panic("failed to add onAdd hook");
     }
 
     /// Registers a hook that runs when the component type is removed from an entity.
     pub fn onRemove(self: *World, comptime T: type, hook: HookFn) void {
-        self.addHook(&self.on_remove_hooks, typeId(T), hook) catch @panic("failed to add onRemove hook");
+        self.addHook(&self.on_remove_hooks, typeIndex(T), hook) catch @panic("failed to add onRemove hook");
     }
 
     fn addHook(self: *World, hooks: *std.AutoHashMap(u64, std.ArrayList(HookFn)), component_id: u64, hook: HookFn) !void {
@@ -386,6 +400,7 @@ pub const World = struct {
     }
 
     fn runHooks(self: *World, hooks: *std.AutoHashMap(u64, std.ArrayList(HookFn)), component_id: u64, entity: root.EntityId) void {
+        if (hooks.count() == 0) return; // the common case: skip the hash
         const registered_hooks = hooks.getPtr(component_id) orelse return;
         for (registered_hooks.items) |hook| {
             hook(self, entity);
@@ -413,7 +428,7 @@ pub const World = struct {
         if (!self.isAlive(entity)) return;
 
         const storage = self.existingStorage(T) orelse return;
-        storage.markChanged(entity) catch unreachable;
+        storage.markChanged(entity, self.change_tick);
     }
 
     /// Was a type recently added to an entity?
@@ -421,7 +436,7 @@ pub const World = struct {
         if (!self.isAlive(entity)) return false;
 
         const storage = self.existingStorage(T) orelse return false;
-        return storage.wasAdded(entity);
+        return storage.wasAdded(entity, self.change_tick);
     }
 
     /// Was a component's data mutated for an entity?
@@ -429,7 +444,7 @@ pub const World = struct {
         if (!self.isAlive(entity)) return false;
 
         const storage = self.existingStorage(T) orelse return false;
-        return storage.wasChanged(entity);
+        return storage.wasChanged(entity, self.change_tick);
     }
 
     /// Was a component removed from an entity?
@@ -437,16 +452,15 @@ pub const World = struct {
         if (!self.isAlive(entity)) return false;
 
         const storage = self.existingStorage(T) orelse return false;
-        return storage.wasRemoved(entity);
+        return storage.wasRemoved(entity, self.change_tick);
     }
 
     /// Ticks and iterates through modifications, allowing for filters such as
     /// `Changed(T)` and `Added(T)` to be available.
     pub fn tick(self: *World) void {
-        var storage_iter = self.component_storages.valueIterator();
-        while (storage_iter.next()) |storage| {
-            storage.clearTracking();
-        }
+        // Wraps after 2^32 ticks, skipping 0 ("never").
+        self.change_tick +%= 1;
+        if (self.change_tick == 0) self.change_tick = 1;
 
         var event_iter = self.event_storages.valueIterator();
         while (event_iter.next()) |storage| {
@@ -651,20 +665,32 @@ pub const World = struct {
     pub fn despawn(self: *World, entity: root.EntityId) void {
         if (!self.isAlive(entity)) return;
 
-        self.removeParent(entity);
-        if (self.children_by_parent.getPtr(entity.id)) |child_list| {
-            for (child_list.items) |child| {
-                _ = self.parent_by_child.remove(child.id);
+        // Worlds that never set a parent skip both hash lookups.
+        if (self.parent_by_child.count() != 0) {
+            self.removeParent(entity);
+            if (self.children_by_parent.getPtr(entity.id)) |child_list| {
+                for (child_list.items) |child| {
+                    _ = self.parent_by_child.remove(child.id);
+                }
+                child_list.clearRetainingCapacity();
             }
-            child_list.clearRetainingCapacity();
         }
 
-        var storage_iter = self.component_storages.iterator();
-        while (storage_iter.next()) |entry| {
-            if (!entry.value_ptr.hasEntity(entity)) continue;
+        if (self.on_remove_hooks.count() == 0) {
+            // No hooks to run first: one call per storage, which ignores entities it lacks.
+            for (self.component_storages.items) |maybe_storage| {
+                if (maybe_storage) |storage| storage.removeEntity(entity, self.change_tick);
+            }
+        } else {
+            // By index: a remove hook may add components, growing the list mid-loop.
+            var type_index: usize = 0;
+            while (type_index < self.component_storages.items.len) : (type_index += 1) {
+                const storage = self.component_storages.items[type_index] orelse continue;
+                if (!storage.hasEntity(entity)) continue;
 
-            self.runHooks(&self.on_remove_hooks, entry.key_ptr.*, entity);
-            entry.value_ptr.removeEntity(entity);
+                self.runHooks(&self.on_remove_hooks, type_index, entity);
+                storage.removeEntity(entity, self.change_tick);
+            }
         }
 
         const index = entity.index();
@@ -695,14 +721,37 @@ pub const World = struct {
 ///
 /// Create one with `world.query(.{ *Position, *const Health })` or even add filters with
 /// `world.query(.{ *Position, With(Player) })`.
+///
+/// It looks up its storages once, then walks only the entities in the smallest storage every
+/// match must have, checking the other terms with array reads. It walks backwards, so removing
+/// the current entity's components (or despawning it) mid-iteration skips nothing.
 pub fn Query(comptime terms: anytype) type {
     comptime validateQueryTerms(terms);
+
+    const Storages = comptime blk: {
+        var types: [terms.len]type = undefined;
+        for (terms, 0..) |term, i| types[i] = ?*root.storage.ComponentStorage(termComponent(term));
+        break :blk std.meta.Tuple(&types);
+    };
+
+    // Per term, the matched entity's position in that term's storage (set for component terms).
+    const Indices = [terms.len]u32;
 
     return struct {
         const Self = @This();
 
         world: *World,
+        /// Per term, the storage of the component it names; null if no entity has had one.
+        storages: Storages,
+        /// Which term's storage `driver` is; its dense index is the walk position itself.
+        driver_term: usize = std.math.maxInt(usize),
+        /// The entities to walk: the smallest storage that every match is in. Null when no
+        /// term requires a component, in which case the query walks every entity slot.
+        driver: ?*const std.ArrayList(root.EntityId),
+        /// Counts down through `driver`, or up through entity slots when there is none.
         index: usize = 0,
+        /// A required component has no storage, so nothing can match.
+        exhausted: bool = false,
 
         pub const is_query = true;
         pub const query_terms = terms;
@@ -713,16 +762,24 @@ pub fn Query(comptime terms: anytype) type {
             world: *World,
             /// Represents the current entity in the existing view
             entity: root.EntityId,
+            storages: Storages,
+            indices: Indices,
 
             /// Returns a pointer to the component requested by `*T` or `*const T`.
-            pub fn get(self: View, comptime Ptr: type) Ptr {
+            pub inline fn get(self: View, comptime Ptr: type) Ptr {
                 comptime {
                     if (!isQueryPointerTerm(Ptr)) {
                         @compileError("View.get expects *T or *const T");
                     }
                 }
-
-                return self.world.get(self.entity, queryComponentType(Ptr)).?;
+                const Component = queryComponentType(Ptr);
+                // A component the query matched on: read it through the storage it already has.
+                inline for (terms, 0..) |term, i| {
+                    if (comptime isQueryPointerTerm(term) and queryComponentType(term) == Component) {
+                        return &self.storages[i].?.values.items[self.indices[i]];
+                    }
+                }
+                return self.world.get(self.entity, Component).?;
             }
         };
 
@@ -731,51 +788,89 @@ pub fn Query(comptime terms: anytype) type {
         /// The more appropriate method of initialisation is `world.query(.{...})`, as this
         /// function is used internally. But who am I (the author) to say what you can do 🤷
         pub fn init(world: *World) Self {
-            return .{
-                .world = world,
-                .index = 0,
-            };
+            var self = Self{ .world = world, .storages = undefined, .driver = null };
+            var smallest: usize = std.math.maxInt(usize);
+            inline for (terms, 0..) |term, i| {
+                self.storages[i] = world.existingStorage(termComponent(term));
+                if (comptime termRequiresComponent(term)) {
+                    if (self.storages[i]) |storage| {
+                        if (storage.entities.items.len < smallest) {
+                            smallest = storage.entities.items.len;
+                            self.driver = &storage.entities;
+                            self.driver_term = i;
+                        }
+                    } else self.exhausted = true;
+                }
+            }
+            if (self.driver) |driver| self.index = driver.items.len;
+            return self;
         }
 
         /// Iterates to the next View
         pub fn next(self: *Self) ?View {
-            while (self.index < self.world.generations.items.len) {
-                const id: u32 = @intCast(self.index);
-                const entity = root.EntityId.init(id, self.world.generations.items[self.index]);
-                self.index += 1;
-
-                if (!self.world.isAlive(entity)) continue;
-                if (!matches(self.world, entity)) continue;
-
-                return .{
-                    .world = self.world,
-                    .entity = entity,
-                };
+            if (self.exhausted) return null;
+            if (self.driver) |driver| {
+                while (self.index > 0) {
+                    self.index -= 1;
+                    // Entities removed earlier in the walk can shrink the list below `index`.
+                    if (self.index >= driver.items.len) continue;
+                    const entity = driver.items[self.index];
+                    var indices: Indices = undefined;
+                    if (self.matches(entity, &indices)) return self.view(entity, indices);
+                }
+                return null;
             }
 
+            const world = self.world;
+            while (self.index < world.generations.items.len) {
+                const id: u32 = @intCast(self.index);
+                const entity = root.EntityId.init(id, world.generations.items[self.index]);
+                self.index += 1;
+                var indices: Indices = undefined;
+                if (world.alive.items[self.index - 1] and self.matches(entity, &indices)) return self.view(entity, indices);
+            }
             return null;
         }
 
-        fn matches(world: *World, entity: root.EntityId) bool {
-            inline for (terms) |term| {
-                if (comptime root.filters.isWith(term)) {
-                    if (!world.hasComponent(entity, term.component)) return false;
-                } else if (comptime root.filters.isWithout(term)) {
-                    if (world.hasComponent(entity, term.component)) return false;
-                } else if (comptime root.filters.isAdded(term)) {
-                    if (!world.wasAdded(entity, term.component)) return false;
-                } else if (comptime root.filters.isChanged(term)) {
-                    if (!world.wasChanged(entity, term.component)) return false;
+        inline fn view(self: *const Self, entity: root.EntityId, indices: Indices) View {
+            return .{ .world = self.world, .entity = entity, .storages = self.storages, .indices = indices };
+        }
+
+        /// Whether `entity` matches every term; fills `indices` for the component terms.
+        inline fn matches(self: *const Self, entity: root.EntityId, indices: *Indices) bool {
+            const tick = self.world.change_tick;
+            inline for (terms, 0..) |term, i| {
+                const storage = self.storages[i];
+                if (comptime root.filters.isWithout(term)) {
+                    if (storage) |s| if (s.has(entity)) return false;
                 } else if (comptime root.filters.isRemoved(term)) {
-                    if (!world.wasRemoved(entity, term.component)) return false;
+                    const s = storage orelse return false;
+                    if (!s.wasRemoved(entity, tick)) return false;
+                } else if (comptime root.filters.isAdded(term)) {
+                    if (!storage.?.wasAdded(entity, tick)) return false;
+                } else if (comptime root.filters.isChanged(term)) {
+                    if (!storage.?.wasChanged(entity, tick)) return false;
+                } else if (i == self.driver_term) {
+                    // The storage being walked: the entity is at the walk position.
+                    indices[i] = @intCast(self.index);
                 } else {
-                    if (!world.hasComponent(entity, queryComponentType(term))) return false;
+                    // `*T`, `*const T` and `With(T)`: required, so its storage exists.
+                    indices[i] = storage.?.denseIndex(entity) orelse return false;
                 }
             }
-
             return true;
         }
     };
+}
+
+/// The component a query term names.
+fn termComponent(comptime term: type) type {
+    return if (isFilterTerm(term)) term.component else queryComponentType(term);
+}
+
+/// Whether every entity a term matches must have its component.
+fn termRequiresComponent(comptime term: type) bool {
+    return !root.filters.isWithout(term) and !root.filters.isRemoved(term);
 }
 
 fn validateQueryTerms(comptime terms: anytype) void {
@@ -1127,4 +1222,49 @@ test "world hierarchy removes parent links" {
     try std.testing.expect(world.getParent(child) == null);
     var children = world.children(parent);
     try std.testing.expect(children.next() == null);
+}
+
+test "despawning entities mid-query still visits every entity exactly once" {
+    const Position = struct { x: u32 };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    for (0..10) |i| _ = try world.spawn(.{Position{ .x = @intCast(i) }});
+
+    var seen = [_]u32{0} ** 10;
+    var query = world.query(.{*const Position});
+    while (query.next()) |view| {
+        seen[view.get(*const Position).x] += 1;
+        world.despawn(view.entity);
+    }
+
+    try std.testing.expectEqualSlices(u32, &([_]u32{1} ** 10), &seen);
+    try std.testing.expectEqual(@as(usize, 0), world.entityCount());
+}
+
+test "query views read each entity's own components after removals reshuffle storages" {
+    const Position = struct { id: u32 };
+    const Velocity = struct { id: u32 };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    var entities: [8]root.EntityId = undefined;
+    for (&entities, 0..) |*entity, i| {
+        entity.* = try world.spawn(.{ Position{ .id = @intCast(i) }, Velocity{ .id = @intCast(i) } });
+    }
+    // Swap-removals move other entities' Positions to new dense slots.
+    try world.removeComponent(entities[0], Position);
+    try world.removeComponent(entities[3], Position);
+    try world.removeComponent(entities[5], Velocity);
+
+    var matched: usize = 0;
+    var query = world.query(.{ *const Position, *const Velocity });
+    while (query.next()) |view| {
+        try std.testing.expectEqual(view.get(*const Position).id, view.get(*const Velocity).id);
+        try std.testing.expectEqual(view.entity.id, view.get(*const Position).id);
+        matched += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), matched); // all but 0, 3 and 5
 }

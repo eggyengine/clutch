@@ -121,11 +121,18 @@ fn runSystem(world: *World, comptime system: anytype) !void {
 
 fn runSystemWithArgs(world: *World, comptime system: anytype, comptime params: []const std.builtin.Type.Fn.Param) !void {
     const needs_commands = comptime systemHasCommandsParam(params);
-    var command_buffer: command.CommandBuffer = undefined;
-    if (needs_commands) {
-        command_buffer = command.CommandBuffer.init(world.allocator);
-    }
-    defer if (needs_commands) command_buffer.deinit();
+    // The world's buffer, unless a system further up the stack (one that ran this stage
+    // itself) still has commands queued in it; then a buffer of our own.
+    var own_buffer: ?command.CommandBuffer = null;
+    const command_buffer: *command.CommandBuffer = if (!needs_commands or world.system_commands.isEmpty())
+        &world.system_commands
+    else blk: {
+        own_buffer = command.CommandBuffer.init(world.allocator);
+        break :blk &own_buffer.?;
+    };
+    defer if (own_buffer) |*buffer| buffer.deinit();
+    // A failed system's commands are dropped, as they were when each run had its own buffer.
+    errdefer if (needs_commands) command_buffer.clearRetainingCapacity();
 
     const ArgTypes = comptime blk: {
         var types: [params.len]type = undefined;
@@ -137,7 +144,7 @@ fn runSystemWithArgs(world: *World, comptime system: anytype, comptime params: [
 
     var args: std.meta.Tuple(&ArgTypes) = undefined;
     inline for (params, 0..) |param, i| {
-        args[i] = try systemArg(world, if (needs_commands) &command_buffer else null, param.type.?);
+        args[i] = try systemArg(world, if (needs_commands) command_buffer else null, param.type.?);
     }
 
     try @call(.auto, system, args);
