@@ -6,6 +6,20 @@ pub fn build(b: *std.Build) void {
 
     const mod = b.addModule("clutch", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
 
+    // Benchmarks always build ReleaseFast: debug timings say nothing about real use.
+    const bench = b.addExecutable(.{
+        .name = "clutch-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "clutch", .module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = .ReleaseFast }) }},
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench);
+    if (b.args) |args| run_bench.addArgs(args);
+    b.step("bench", "Time clutch's common operations (ReleaseFast); `-- <count>` sets the entity count").dependOn(&run_bench.step);
+
     const test_step = b.step("test", "Run tests");
     const test_runner = defaultTestRunner(b);
 
