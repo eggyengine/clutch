@@ -10,6 +10,11 @@ const runs = 5;
 const Position = struct { x: f32 = 0, y: f32 = 0, z: f32 = 0 };
 const Velocity = struct { x: f32 = 1, y: f32 = 2, z: f32 = 3 };
 const Health = struct { hp: f32 = 100 };
+/// Health without change tracking (`track_changes = false`).
+const Lifetime = struct {
+    pub const track_changes = false;
+    seconds: f32 = 1,
+};
 /// On 1% of entities, for queries that should skip almost everything.
 const Rare = struct { id: u32 = 0 };
 
@@ -33,9 +38,11 @@ const cases = [_]Case{
     .{ .name = "add component (warm storage)", .setup = setupWarmHealth, .run = addHealth },
     .{ .name = "add component (reserved)", .setup = setupReservedHealth, .run = addHealth },
     .{ .name = "remove component", .setup = setupWithHealth, .run = removeHealth },
+    .{ .name = "add + remove, untracked component", .setup = setupMoving, .run = addRemoveUntracked },
     .{ .name = "markChanged 10% + query Changed", .setup = setupMoving, .run = changedTenth },
     .{ .name = "commands: add component", .setup = setupMoving, .run = commandAdd },
     .{ .name = "despawn", .setup = setupMoving, .run = despawnAll },
+    .{ .name = "despawn (32 types in world)", .setup = setupManyTypes, .run = despawnAll },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -103,12 +110,32 @@ fn setupWithHealth(world: *clutch.World, entities: []clutch.EntityId) !void {
     for (entities) |entity| try world.addComponent(entity, Health{});
 }
 
+fn addRemoveUntracked(world: *clutch.World, entities: []clutch.EntityId) !void {
+    for (entities) |entity| try world.addComponent(entity, Lifetime{});
+    for (entities) |entity| try world.removeComponent(entity, Lifetime);
+}
+
 fn addHealth(world: *clutch.World, entities: []clutch.EntityId) !void {
     for (entities) |entity| try world.addComponent(entity, Health{});
 }
 
 fn removeHealth(world: *clutch.World, entities: []clutch.EntityId) !void {
     for (entities) |entity| try world.removeComponent(entity, Health);
+}
+
+/// A distinct component type per `i`, to fill a world with many storages.
+fn Tag(comptime i: usize) type {
+    return struct {
+        const index = i;
+        value: u8 = 0,
+    };
+}
+
+/// Entities with Position and Velocity, in a world that also has 30 other component types.
+fn setupManyTypes(world: *clutch.World, entities: []clutch.EntityId) !void {
+    const other = try world.spawn(.{});
+    inline for (0..30) |i| try world.addComponent(other, Tag(i){});
+    try setupMoving(world, entities);
 }
 
 fn spawnTwo(world: *clutch.World, entities: []clutch.EntityId) !void {

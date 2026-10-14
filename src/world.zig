@@ -106,8 +106,24 @@ fn deinitTypedResource(comptime T: type, ptr: *anyopaque, allocator: std.mem.All
     allocator.destroy(resource);
 }
 
-/// One entity id's generation (bumped on despawn, so stale handles stop matching) and liveness.
-const EntitySlot = struct { generation: u32, alive: bool };
+/// One entity id's generation (bumped on despawn, so stale handles stop matching), liveness,
+/// and which component types it has (see `components`).
+const EntitySlot = struct {
+    generation: u32,
+    alive: bool,
+    /// Bit `i` set: the entity has the component with type index `i` (for `i` below
+    /// `overflow_bit_index`). The top bit is sticky until despawn: it may have components with
+    /// larger type indices. Lets `despawn` visit only the storages the entity is in.
+    components: u64 = 0,
+};
+
+const overflow_bit_index = 63;
+const overflow_bit: u64 = 1 << overflow_bit_index;
+
+/// The `EntitySlot.components` bit for type index `type_index`.
+inline fn componentBit(type_index: usize) u64 {
+    return if (type_index < overflow_bit_index) @as(u64, 1) << @intCast(type_index) else overflow_bit;
+}
 
 /// Stores all components and entities using the ECS paradigm.
 ///
@@ -339,6 +355,8 @@ pub const World = struct {
         }
 
         const id: u32 = @intCast(self.slots.items.len);
+        // Room for every id in `free_ids` now, so `despawn` never allocates.
+        try self.free_ids.ensureTotalCapacity(self.allocator, self.slots.items.len + 1);
         try self.slots.append(self.allocator, .{ .generation = 0, .alive = true });
         self.living_count += 1;
 
@@ -378,6 +396,7 @@ pub const World = struct {
         const T = @TypeOf(component);
         const storage = try self.storageFor(T);
         if (try storage.insert(self.allocator, entity, component, self.change_tick)) {
+            self.slots.items[entity.index()].components |= componentBit(typeIndex(T));
             self.runHooks(&self.on_add_hooks, typeIndex(T), entity);
         }
     }
@@ -393,6 +412,8 @@ pub const World = struct {
             self.runHooks(&self.on_remove_hooks, typeIndex(T), entity);
         }
         storage.remove(entity, self.change_tick);
+        // The overflow bit stays: it covers every large type index, not just this one.
+        if (typeIndex(T) < overflow_bit_index) self.slots.items[entity.index()].components &= ~componentBit(typeIndex(T));
     }
 
     /// Removes component(s) from an entity, ignoring missing or dead entities.
@@ -696,27 +717,46 @@ pub const World = struct {
             }
         }
 
+        // Remove only the components the entity has. Tick 0: a despawned entity never matches
+        // `Removed`, so a reused id doesn't either. Re-read the mask each round, since a remove
+        // hook may add components to the entity being despawned.
+        const index = entity.index();
         if (self.on_remove_hooks.count() == 0) {
-            // No hooks to run first: one call per storage, which ignores entities it lacks.
-            for (self.component_storages.items) |maybe_storage| {
-                if (maybe_storage) |storage| storage.removeEntity(entity, self.change_tick);
+            // Nothing can add components meanwhile: walk a copy of the mask, clear it once.
+            var components = self.slots.items[index].components;
+            while (components & ~overflow_bit != 0) : (components &= components - 1) {
+                self.component_storages.items[@ctz(components)].?.removeEntity(entity, 0);
             }
-        } else {
-            // By index: a remove hook may add components, growing the list mid-loop.
-            var type_index: usize = 0;
+            if (components & overflow_bit != 0) {
+                for (self.component_storages.items[overflow_bit_index..]) |maybe_storage| {
+                    if (maybe_storage) |storage| storage.removeEntity(entity, 0);
+                }
+            }
+            self.slots.items[index].components = 0;
+        }
+        while (self.slots.items[index].components != 0) {
+            const components = self.slots.items[index].components;
+            if (components & ~overflow_bit != 0) {
+                const type_index: usize = @ctz(components);
+                self.slots.items[index].components &= ~componentBit(type_index);
+                self.runHooks(&self.on_remove_hooks, type_index, entity);
+                self.component_storages.items[type_index].?.removeEntity(entity, 0);
+                continue;
+            }
+            // Only large type indices left, which the mask doesn't track one by one.
+            self.slots.items[index].components &= ~overflow_bit;
+            var type_index: usize = overflow_bit_index;
             while (type_index < self.component_storages.items.len) : (type_index += 1) {
                 const storage = self.component_storages.items[type_index] orelse continue;
                 if (!storage.hasEntity(entity)) continue;
-
                 self.runHooks(&self.on_remove_hooks, type_index, entity);
-                storage.removeEntity(entity, self.change_tick);
+                storage.removeEntity(entity, 0);
             }
         }
 
-        const index = entity.index();
         self.slots.items[index].alive = false;
         self.slots.items[index].generation += 1;
-        self.free_ids.append(self.allocator, entity.id) catch unreachable;
+        self.free_ids.appendAssumeCapacity(entity.id);
         self.living_count -= 1;
     }
 
@@ -1305,4 +1345,21 @@ test "reserved worlds spawn and add without reallocating" {
     try std.testing.expectEqual(values_before, storage.values.items.ptr);
     try std.testing.expectEqual(slots_before, world.slots.items.ptr);
     try std.testing.expectEqual(@as(usize, 64), world.entityCount());
+}
+
+test "a despawned entity's reused id does not match Removed in the same tick" {
+    const Health = struct { hp: f32 };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const old = try world.spawn(.{Health{ .hp = 1 }});
+    world.tick();
+    world.despawn(old);
+    const reused = try world.spawn(.{});
+    try std.testing.expectEqual(old.id, reused.id);
+
+    try std.testing.expect(!world.wasRemoved(reused, Health));
+    var removed = world.query(.{root.filters.Removed(Health)});
+    try std.testing.expect(removed.next() == null);
 }

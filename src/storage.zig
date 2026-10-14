@@ -10,17 +10,18 @@ pub const Tick = u32;
 /// When a value was added, and when it last changed (0 if never since it was added).
 pub const Ticks = struct { added: Tick, changed: Tick };
 
-/// One entity id's entry in a storage's sparse array.
-const Slot = struct {
-    /// The entity's position in the dense arrays, or `absent`.
-    index: u32,
-    /// The tick the entity's value was last removed on, or 0.
-    removed: Tick,
-};
-
 /// Marks an entity id with no value in a `ComponentStorage`.
 const absent = std.math.maxInt(u32);
-const empty_slot = Slot{ .index = absent, .removed = 0 };
+
+/// Whether component type `T` keeps change ticks, which `Added`, `Changed`, `Removed` and
+/// `markChanged` need. On by default; a component opts out, making its adds and removals
+/// cheaper, by declaring `pub const track_changes = false;`.
+pub fn tracksChanges(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => !@hasDecl(T, "track_changes") or T.track_changes,
+        else => true,
+    };
+}
 
 /// A sparse set holding one component type, as EnTT and pico_ecs store them.
 ///
@@ -32,11 +33,22 @@ const empty_slot = Slot{ .index = absent, .removed = 0 };
 /// in another): each removal then touches fewer cache lines, which matters once a world has
 /// several storages. `entities` and `values` stay separate so queries stream only what they use.
 pub fn ComponentStorage(comptime T: type) type {
+    const tracked = tracksChanges(T);
     return struct {
         const Self = @This();
 
+        /// One entity id's entry in `sparse`.
+        const Slot = if (tracked) struct {
+            /// The entity's position in the dense arrays, or `absent`.
+            index: u32,
+            /// The tick the entity's value was last removed on, or 0.
+            removed: Tick,
+        } else struct { index: u32 };
+        const empty_slot: Slot = if (tracked) .{ .index = absent, .removed = 0 } else .{ .index = absent };
+
         entities: std.ArrayList(EntityId) = .empty,
         values: std.ArrayList(T) = .empty,
+        /// Empty, and never touched, when `T` opts out of change tracking.
         ticks: std.ArrayList(Ticks) = .empty,
         /// Entity id -> `Slot`.
         sparse: std.ArrayList(Slot) = .empty,
@@ -62,7 +74,7 @@ pub fn ComponentStorage(comptime T: type) type {
         pub fn insert(self: *Self, allocator: std.mem.Allocator, entity: EntityId, value: T, tick: Tick) !bool {
             if (self.denseIndex(entity)) |index| {
                 self.values.items[index] = value;
-                self.ticks.items[index].changed = tick;
+                if (tracked) self.ticks.items[index].changed = tick;
                 return false;
             }
 
@@ -74,10 +86,12 @@ pub fn ComponentStorage(comptime T: type) type {
             self.sparse.items[entity.id].index = @intCast(index);
             self.entities.items.len += 1;
             self.values.items.len += 1;
-            self.ticks.items.len += 1;
             self.entities.items[index] = entity;
             self.values.items[index] = value;
-            self.ticks.items[index] = .{ .added = tick, .changed = 0 };
+            if (tracked) {
+                self.ticks.items.len += 1;
+                self.ticks.items[index] = .{ .added = tick, .changed = 0 };
+            }
             return true;
         }
 
@@ -86,7 +100,7 @@ pub fn ComponentStorage(comptime T: type) type {
         pub fn reserve(self: *Self, allocator: std.mem.Allocator, count: usize) !void {
             try self.entities.ensureTotalCapacityPrecise(allocator, count);
             try self.values.ensureTotalCapacityPrecise(allocator, count);
-            try self.ticks.ensureTotalCapacityPrecise(allocator, count);
+            if (tracked) try self.ticks.ensureTotalCapacityPrecise(allocator, count);
             try self.sparse.ensureTotalCapacityPrecise(allocator, count);
         }
 
@@ -107,7 +121,7 @@ pub fn ComponentStorage(comptime T: type) type {
             const capacity = @max(8, self.entities.items.len * 2);
             try self.entities.ensureTotalCapacityPrecise(allocator, capacity);
             try self.values.ensureTotalCapacityPrecise(allocator, capacity);
-            try self.ticks.ensureTotalCapacityPrecise(allocator, capacity);
+            if (tracked) try self.ticks.ensureTotalCapacityPrecise(allocator, capacity);
         }
 
         /// The dense index of `entity`'s value, or null if it has none.
@@ -135,32 +149,39 @@ pub fn ComponentStorage(comptime T: type) type {
                 const moved = self.entities.items[last];
                 self.entities.items[index] = moved;
                 self.values.items[index] = self.values.items[last];
-                self.ticks.items[index] = self.ticks.items[last];
+                if (tracked) self.ticks.items[index] = self.ticks.items[last];
+                self.sparse.items[entity.id].index = absent;
                 self.sparse.items[moved.id].index = index;
-            }
+            } else self.sparse.items[entity.id].index = absent;
             self.entities.items.len = last;
             self.values.items.len = last;
-            self.ticks.items.len = last;
-            self.sparse.items[entity.id] = .{ .index = absent, .removed = tick };
+            if (tracked) {
+                self.ticks.items.len = last;
+                self.sparse.items[entity.id].removed = tick;
+            }
         }
 
         pub fn markChanged(self: *Self, entity: EntityId, tick: Tick) void {
+            if (!tracked) @compileError(@typeName(T) ++ " opts out of change tracking (track_changes = false)");
             const index = self.denseIndex(entity) orelse return;
             self.ticks.items[index].changed = tick;
         }
 
         pub fn wasAdded(self: *const Self, entity: EntityId, tick: Tick) bool {
+            if (!tracked) @compileError(@typeName(T) ++ " opts out of change tracking (track_changes = false)");
             const index = self.denseIndex(entity) orelse return false;
             return self.ticks.items[index].added == tick;
         }
 
         pub fn wasChanged(self: *const Self, entity: EntityId, tick: Tick) bool {
+            if (!tracked) @compileError(@typeName(T) ++ " opts out of change tracking (track_changes = false)");
             const index = self.denseIndex(entity) orelse return false;
             return self.ticks.items[index].changed == tick;
         }
 
         /// Whether `entity` lost its value on `tick` and hasn't been given one again since.
         pub fn wasRemoved(self: *const Self, entity: EntityId, tick: Tick) bool {
+            if (!tracked) @compileError(@typeName(T) ++ " opts out of change tracking (track_changes = false)");
             if (entity.id >= self.sparse.items.len) return false;
             const slot = self.sparse.items[entity.id];
             return slot.index == absent and slot.removed == tick;
@@ -249,4 +270,25 @@ test "a value added back after removal is no longer reported as removed" {
     try std.testing.expect(storage.wasRemoved(entity, 2));
     try storage.add(std.testing.allocator, entity, .{ .hp = 5 }, 2);
     try std.testing.expect(!storage.wasRemoved(entity, 2));
+}
+
+test "a component that opts out of change tracking still adds, gets and removes" {
+    const Particle = struct {
+        pub const track_changes = false;
+        life: f32,
+    };
+
+    var storage = ComponentStorage(Particle).init(std.testing.allocator);
+    defer storage.deinit(std.testing.allocator);
+
+    const a = EntityId.init(0, 0);
+    const b = EntityId.init(1, 0);
+    try storage.add(std.testing.allocator, a, .{ .life = 1 }, 1);
+    try storage.add(std.testing.allocator, b, .{ .life = 2 }, 1);
+    storage.remove(a, 2);
+
+    try std.testing.expect(!storage.has(a));
+    try std.testing.expectEqual(@as(f32, 2), storage.get(b).?.life);
+    try std.testing.expectEqual(@as(usize, 0), storage.ticks.items.len);
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(storage).Slot));
 }
