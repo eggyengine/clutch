@@ -29,6 +29,7 @@ const Case = struct {
 const cases = [_]Case{
     .{ .name = "spawn (2 components)", .setup = setupNothing, .run = spawnTwo },
     .{ .name = "spawn (2 components, reserved)", .setup = setupReserved, .run = spawnTwo },
+    .{ .name = "spawnBatch (2 components)", .setup = setupNothing, .run = spawnBatchTwo },
     .{ .name = "get", .setup = setupMoving, .run = getEach },
     .{ .name = "query 1 component", .setup = setupMoving, .run = queryOne },
     .{ .name = "query 2 components", .setup = setupMoving, .run = queryTwo },
@@ -39,10 +40,13 @@ const cases = [_]Case{
     .{ .name = "add component (reserved)", .setup = setupReservedHealth, .run = addHealth },
     .{ .name = "remove component", .setup = setupWithHealth, .run = removeHealth },
     .{ .name = "add + remove, untracked component", .setup = setupMoving, .run = addRemoveUntracked },
+    .{ .name = "addComponents + removeComponents", .setup = setupMoving, .run = addRemoveBatch },
+    .{ .name = "add/removeComponents, untracked", .setup = setupMoving, .run = addRemoveBatchUntracked },
     .{ .name = "markChanged 10% + query Changed", .setup = setupMoving, .run = changedTenth },
     .{ .name = "commands: add component", .setup = setupMoving, .run = commandAdd },
     .{ .name = "despawn", .setup = setupMoving, .run = despawnAll },
     .{ .name = "despawn (32 types in world)", .setup = setupManyTypes, .run = despawnAll },
+    .{ .name = "despawnBatch", .setup = setupMoving, .run = despawnBatchAll },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -189,6 +193,24 @@ fn commandAdd(world: *clutch.World, entities: []clutch.EntityId) !void {
     defer commands.deinit();
     for (entities) |entity| try commands.addComponent(entity, Health{});
     try commands.apply(world);
+}
+
+fn spawnBatchTwo(world: *clutch.World, entities: []clutch.EntityId) !void {
+    try world.spawnBatch(entities, .{ Position{}, Velocity{} });
+}
+
+fn addRemoveBatch(world: *clutch.World, entities: []clutch.EntityId) !void {
+    try world.addComponents(entities, Health{});
+    try world.removeComponents(entities, Health);
+}
+
+fn addRemoveBatchUntracked(world: *clutch.World, entities: []clutch.EntityId) !void {
+    try world.addComponents(entities, Lifetime{});
+    try world.removeComponents(entities, Lifetime);
+}
+
+fn despawnBatchAll(world: *clutch.World, entities: []clutch.EntityId) !void {
+    try world.despawnBatch(entities);
 }
 
 fn despawnAll(world: *clutch.World, entities: []clutch.EntityId) !void {

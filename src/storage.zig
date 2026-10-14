@@ -12,6 +12,9 @@ pub const Ticks = struct { added: Tick, changed: Tick };
 
 /// Marks an entity id with no value in a `ComponentStorage`.
 const absent = std.math.maxInt(u32);
+/// Marks a dense entry `removeMany` is about to compact away. No live entity has this id:
+/// it equals `absent`, which the world never hands out.
+const doomed_id = std.math.maxInt(u32);
 
 /// Whether component type `T` keeps change ticks, which `Added`, `Changed`, `Removed` and
 /// `markChanged` need. On by default; a component opts out, making its adds and removals
@@ -72,15 +75,27 @@ pub fn ComponentStorage(comptime T: type) type {
 
         /// `add`, returning whether `entity` had no value before (so on-add hooks should run).
         pub fn insert(self: *Self, allocator: std.mem.Allocator, entity: EntityId, value: T, tick: Tick) !bool {
+            // Common case: one compare each. The growth paths are out of line.
+            if (entity.id >= self.sparse.items.len) try self.growSparseTo(allocator, entity.id);
+            if (self.entities.items.len == self.entities.capacity) try self.growDense(allocator, 1);
+            return self.insertAssumeCapacity(entity, value, tick);
+        }
+
+        /// Make room for `additional` more values, for entity ids up to `max_id`, so that many
+        /// `insertAssumeCapacity` calls cannot fail. Leaves the storage unchanged on failure.
+        pub fn ensureUnusedCapacity(self: *Self, allocator: std.mem.Allocator, additional: usize, max_id: u32) !void {
+            if (max_id >= self.sparse.items.len) try self.growSparseTo(allocator, max_id);
+            if (self.entities.capacity - self.entities.items.len < additional) try self.growDense(allocator, additional);
+        }
+
+        /// `insert` after `ensureUnusedCapacity` made room for it.
+        pub fn insertAssumeCapacity(self: *Self, entity: EntityId, value: T, tick: Tick) bool {
             if (self.denseIndex(entity)) |index| {
                 self.values.items[index] = value;
                 if (tracked) self.ticks.items[index].changed = tick;
                 return false;
             }
-
-            // Common case: one compare each. The growth paths are out of line.
-            if (entity.id >= self.sparse.items.len) try self.growSparseTo(allocator, entity.id);
-            if (self.entities.items.len == self.entities.capacity) try self.growDense(allocator);
+            std.debug.assert(entity.id < self.sparse.items.len and self.entities.items.len < self.entities.capacity);
 
             const index = self.entities.items.len;
             self.sparse.items[entity.id].index = @intCast(index);
@@ -113,12 +128,13 @@ pub fn ComponentStorage(comptime T: type) type {
             self.sparse.appendNTimesAssumeCapacity(empty_slot, id + 1 - self.sparse.items.len);
         }
 
-        /// Give the dense arrays room for at least one more value, all with the same capacity,
+        /// Give the dense arrays room for `additional` more values, all with the same capacity,
         /// so `insert` checks one of them. Leaves the storage unchanged on failure.
-        fn growDense(self: *Self, allocator: std.mem.Allocator) !void {
+        fn growDense(self: *Self, allocator: std.mem.Allocator, additional: usize) !void {
             @branchHint(.cold);
             // Doubling: fewer reallocations, and half the copying of 1.5x growth.
-            const capacity = @max(8, self.entities.items.len * 2);
+            const len = self.entities.items.len;
+            const capacity = @max(8, len * 2, len + additional);
             try self.entities.ensureTotalCapacityPrecise(allocator, capacity);
             try self.values.ensureTotalCapacityPrecise(allocator, capacity);
             if (tracked) try self.ticks.ensureTotalCapacityPrecise(allocator, capacity);
@@ -159,6 +175,37 @@ pub fn ComponentStorage(comptime T: type) type {
                 self.ticks.items.len = last;
                 self.sparse.items[entity.id].removed = tick;
             }
+        }
+
+        /// `remove` for each of `entities`; those without a value are skipped.
+        pub fn removeMany(self: *Self, entities: []const EntityId, tick: Tick) void {
+            // Small batches: swap-remove each. Large ones: mark them, then compact once, which
+            // touches every value once instead of moving values that are about to go too.
+            if (entities.len * 4 < self.entities.items.len) {
+                for (entities) |entity| self.remove(entity, tick);
+                return;
+            }
+
+            for (entities) |entity| {
+                const index = self.denseIndex(entity) orelse continue;
+                self.entities.items[index].id = doomed_id;
+                self.sparse.items[entity.id].index = absent;
+                if (tracked) self.sparse.items[entity.id].removed = tick;
+            }
+            var kept: usize = 0;
+            for (self.entities.items, 0..) |entity, index| {
+                if (entity.id == doomed_id) continue;
+                if (index != kept) {
+                    self.entities.items[kept] = entity;
+                    self.values.items[kept] = self.values.items[index];
+                    if (tracked) self.ticks.items[kept] = self.ticks.items[index];
+                    self.sparse.items[entity.id].index = @intCast(kept);
+                }
+                kept += 1;
+            }
+            self.entities.items.len = kept;
+            self.values.items.len = kept;
+            if (tracked) self.ticks.items.len = kept;
         }
 
         pub fn markChanged(self: *Self, entity: EntityId, tick: Tick) void {
@@ -291,4 +338,27 @@ test "a component that opts out of change tracking still adds, gets and removes"
     try std.testing.expectEqual(@as(f32, 2), storage.get(b).?.life);
     try std.testing.expectEqual(@as(usize, 0), storage.ticks.items.len);
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(storage).Slot));
+}
+
+test "removing most of a storage at once compacts it and keeps the rest in order" {
+    const Value = struct { id: u32 };
+
+    var storage = ComponentStorage(Value).init(std.testing.allocator);
+    defer storage.deinit(std.testing.allocator);
+
+    var entities: [8]EntityId = undefined;
+    for (&entities, 0..) |*entity, i| {
+        entity.* = EntityId.init(@intCast(i), 0);
+        try storage.add(std.testing.allocator, entity.*, .{ .id = @intCast(i) }, 1);
+    }
+    // 5 of 8, with a repeat and an entity that has no value: the compacting path.
+    storage.removeMany(&.{ entities[0], entities[2], entities[2], entities[3], entities[6], EntityId.init(40, 0) }, 2);
+
+    try std.testing.expectEqual(@as(usize, 4), storage.values.items.len);
+    for ([_]u32{ 1, 4, 5, 7 }, 0..) |id, dense| {
+        try std.testing.expectEqual(id, storage.values.items[dense].id);
+        try std.testing.expectEqual(id, storage.get(EntityId.init(id, 0)).?.id);
+    }
+    try std.testing.expect(storage.wasRemoved(entities[3], 2));
+    try std.testing.expect(!storage.has(entities[6]));
 }

@@ -8,6 +8,7 @@ const ErasedStorage = struct {
     deinitFn: *const fn (*anyopaque, std.mem.Allocator) void,
     hasEntityFn: *const fn (*anyopaque, root.EntityId) bool,
     removeEntityFn: *const fn (*anyopaque, root.EntityId, Tick) void,
+    removeManyFn: *const fn (*anyopaque, []const root.EntityId, Tick) void,
 
     fn deinit(self: ErasedStorage, allocator: std.mem.Allocator) void {
         self.deinitFn(self.ptr, allocator);
@@ -19,6 +20,11 @@ const ErasedStorage = struct {
 
     fn removeEntity(self: ErasedStorage, entity: root.EntityId, tick: Tick) void {
         self.removeEntityFn(self.ptr, entity, tick);
+    }
+
+    /// `removeEntity` for each of `entities`, in one call into typed code.
+    fn removeMany(self: ErasedStorage, entities: []const root.EntityId, tick: Tick) void {
+        self.removeManyFn(self.ptr, entities, tick);
     }
 };
 
@@ -111,9 +117,10 @@ fn deinitTypedResource(comptime T: type, ptr: *anyopaque, allocator: std.mem.All
 const EntitySlot = struct {
     generation: u32,
     alive: bool,
-    /// Bit `i` set: the entity has the component with type index `i` (for `i` below
-    /// `overflow_bit_index`). The top bit is sticky until despawn: it may have components with
-    /// larger type indices. Lets `despawn` visit only the storages the entity is in.
+    /// Bit `i` set: the entity may have the component with type index `i` (for `i` below
+    /// `overflow_bit_index`); the top bit covers all larger type indices. Set on add and only
+    /// cleared on despawn, so it can over-report: removing from a storage the entity isn't in
+    /// is a no-op. Lets `despawn` skip the storages the entity was never in.
     components: u64 = 0,
 };
 
@@ -151,6 +158,8 @@ pub const World = struct {
 
     /// Reused by every system that takes `Commands`, so running one allocates nothing.
     system_commands: root.CommandBuffer,
+    /// Reused by `despawnBatch` for the entities it is despawning.
+    despawn_scratch: std.ArrayList(root.EntityId) = .empty,
 
     /// Indexed by `typeIndex`; null for component types this world hasn't stored yet.
     component_storages: std.ArrayList(?ErasedStorage),
@@ -233,6 +242,7 @@ pub const World = struct {
         self.parent_by_child.deinit();
 
         self.system_commands.deinit();
+        self.despawn_scratch.deinit(self.allocator);
         self.slots.deinit(self.allocator);
         self.free_ids.deinit(self.allocator);
     }
@@ -267,6 +277,12 @@ pub const World = struct {
             .removeEntityFn = struct {
                 fn run(ptr: *anyopaque, entity: root.EntityId, at: Tick) void {
                     removeEntityFromTypedStorage(T, ptr, entity, at);
+                }
+            }.run,
+            .removeManyFn = struct {
+                fn run(ptr: *anyopaque, entities: []const root.EntityId, at: Tick) void {
+                    const typed: *Storage = @ptrCast(@alignCast(ptr));
+                    typed.removeMany(entities, at);
                 }
             }.run,
         });
@@ -346,6 +362,16 @@ pub const World = struct {
 
     /// Initialises a new empty entity in the world.
     fn createEntity(self: *World) !root.EntityId {
+        if (self.free_ids.items.len == 0) {
+            // Room for every id in `free_ids` now, so `despawn` never allocates.
+            try self.free_ids.ensureTotalCapacity(self.allocator, self.slots.items.len + 1);
+            try self.slots.ensureUnusedCapacity(self.allocator, 1);
+        }
+        return self.createEntityAssumeCapacity();
+    }
+
+    /// `createEntity` once `free_ids` has an id or `slots` and `free_ids` have room for one more.
+    fn createEntityAssumeCapacity(self: *World) root.EntityId {
         if (self.free_ids.items.len > 0) {
             const id = self.free_ids.pop().?;
             self.slots.items[@intCast(id)].alive = true;
@@ -355,9 +381,7 @@ pub const World = struct {
         }
 
         const id: u32 = @intCast(self.slots.items.len);
-        // Room for every id in `free_ids` now, so `despawn` never allocates.
-        try self.free_ids.ensureTotalCapacity(self.allocator, self.slots.items.len + 1);
-        try self.slots.append(self.allocator, .{ .generation = 0, .alive = true });
+        self.slots.appendAssumeCapacity(.{ .generation = 0, .alive = true });
         self.living_count += 1;
 
         return root.EntityId.init(id, 0);
@@ -411,9 +435,8 @@ pub const World = struct {
         if (self.on_remove_hooks.count() != 0 and storage.has(entity)) {
             self.runHooks(&self.on_remove_hooks, typeIndex(T), entity);
         }
+        // The entity's `components` bit stays set until despawn (see `EntitySlot`).
         storage.remove(entity, self.change_tick);
-        // The overflow bit stays: it covers every large type index, not just this one.
-        if (typeIndex(T) < overflow_bit_index) self.slots.items[entity.index()].components &= ~componentBit(typeIndex(T));
     }
 
     /// Removes component(s) from an entity, ignoring missing or dead entities.
@@ -739,8 +762,11 @@ pub const World = struct {
             if (components & ~overflow_bit != 0) {
                 const type_index: usize = @ctz(components);
                 self.slots.items[index].components &= ~componentBit(type_index);
+                // The mask may over-report (see `EntitySlot`): only real components get hooks.
+                const storage = self.component_storages.items[type_index].?;
+                if (!storage.hasEntity(entity)) continue;
                 self.runHooks(&self.on_remove_hooks, type_index, entity);
-                self.component_storages.items[type_index].?.removeEntity(entity, 0);
+                storage.removeEntity(entity, 0);
                 continue;
             }
             // Only large type indices left, which the mask doesn't track one by one.
@@ -758,6 +784,127 @@ pub const World = struct {
         self.slots.items[index].generation += 1;
         self.free_ids.appendAssumeCapacity(entity.id);
         self.living_count -= 1;
+    }
+
+    /// Spawns `out.len` entities, each with `components` (a tuple, as in `spawn`), and writes
+    /// their ids to `out`. Like calling `spawn` that many times, but each component's storage
+    /// is found and grown once for the whole batch. On error nothing is spawned.
+    pub fn spawnBatch(self: *World, out: []root.EntityId, components: anytype) !void {
+        if (out.len == 0) return;
+        // A hook may add components, using up capacity reserved for the batch: go one by one.
+        if (self.on_add_hooks.count() != 0) {
+            var spawned: usize = 0;
+            errdefer for (out[0..spawned]) |entity| self.despawn(entity);
+            for (out) |*entity| {
+                entity.* = try self.spawn(components);
+                spawned += 1;
+            }
+            return;
+        }
+
+        // Reserve everything first, so a failed allocation leaves the world unchanged.
+        const reused = @min(self.free_ids.items.len, out.len);
+        const fresh = out.len - reused;
+        try self.slots.ensureUnusedCapacity(self.allocator, fresh);
+        try self.free_ids.ensureTotalCapacity(self.allocator, self.slots.items.len + fresh);
+        var max_id: u32 = if (fresh > 0) @intCast(self.slots.items.len + fresh - 1) else 0;
+        for (self.free_ids.items[self.free_ids.items.len - reused ..]) |id| max_id = @max(max_id, id);
+        inline for (components) |component| {
+            const storage = try self.storageFor(@TypeOf(component));
+            try storage.ensureUnusedCapacity(self.allocator, out.len, max_id);
+        }
+
+        var mask: u64 = 0;
+        inline for (components) |component| mask |= componentBit(typeIndex(@TypeOf(component)));
+        for (out) |*entity| {
+            entity.* = self.createEntityAssumeCapacity();
+            self.slots.items[entity.index()].components = mask;
+        }
+        inline for (components) |component| {
+            const storage = self.existingStorage(@TypeOf(component)).?;
+            for (out) |entity| _ = storage.insertAssumeCapacity(entity, component, self.change_tick);
+        }
+    }
+
+    /// Adds `component` to every entity in `entities` (replacing values they already have),
+    /// finding and growing its storage once. Fails with `EntityNotAlive`, changing nothing, if
+    /// any entity is dead.
+    pub fn addComponents(self: *World, entities: []const root.EntityId, component: anytype) !void {
+        const T = @TypeOf(component);
+        // A hook may add components, using up capacity reserved for the batch: go one by one.
+        if (self.on_add_hooks.count() != 0) {
+            for (entities) |entity| if (!self.isAlive(entity)) return error.EntityNotAlive;
+            for (entities) |entity| try self.addComponent(entity, component);
+            return;
+        }
+
+        // Check every entity before changing anything. Each one's `components` bit is set on
+        // the way: the mask may over-report (see `EntitySlot`), so a failure here is harmless,
+        // and the add loop below doesn't touch the slots again.
+        const bit = componentBit(typeIndex(T));
+        var max_id: u32 = 0;
+        for (entities) |entity| {
+            if (!self.isAlive(entity)) return error.EntityNotAlive;
+            self.slots.items[entity.index()].components |= bit;
+            max_id = @max(max_id, entity.id);
+        }
+        if (entities.len == 0) return;
+
+        const storage = try self.storageFor(T);
+        try storage.ensureUnusedCapacity(self.allocator, entities.len, max_id);
+        for (entities) |entity| _ = storage.insertAssumeCapacity(entity, component, self.change_tick);
+    }
+
+    /// Removes component `T` from every entity in `entities` that has it, finding its storage
+    /// once. Fails with `EntityNotAlive`, changing nothing, if any entity is dead.
+    pub fn removeComponents(self: *World, entities: []const root.EntityId, comptime T: type) !void {
+        for (entities) |entity| if (!self.isAlive(entity)) return error.EntityNotAlive;
+        if (self.on_remove_hooks.count() != 0) {
+            for (entities) |entity| try self.removeComponent(entity, T);
+            return;
+        }
+
+        // Their `components` bits stay set until despawn (see `EntitySlot`).
+        const storage = self.existingStorage(T) orelse return;
+        storage.removeMany(entities, self.change_tick);
+    }
+
+    /// Despawns every living entity in `entities`; dead ids and repeats are skipped. Removes
+    /// each component type from the whole batch in one loop. Fails only if it cannot allocate,
+    /// before changing anything.
+    pub fn despawnBatch(self: *World, entities: []const root.EntityId) !void {
+        // Hierarchy links and remove hooks need `despawn`'s per-entity bookkeeping.
+        if (self.parent_by_child.count() != 0 or self.on_remove_hooks.count() != 0) {
+            for (entities) |entity| self.despawn(entity);
+            return;
+        }
+
+        try self.despawn_scratch.ensureTotalCapacity(self.allocator, entities.len);
+        self.despawn_scratch.clearRetainingCapacity();
+        // One pass over the slots: kill each entity and free its id. The bumped generation
+        // makes a repeat of it in `entities` fail `isAlive`, so it is skipped.
+        var components: u64 = 0;
+        for (entities) |entity| {
+            if (!self.isAlive(entity)) continue;
+            const slot = &self.slots.items[entity.index()];
+            components |= slot.components;
+            slot.* = .{ .generation = slot.generation + 1, .alive = false };
+            self.free_ids.appendAssumeCapacity(entity.id);
+            self.despawn_scratch.appendAssumeCapacity(entity);
+        }
+        const doomed = self.despawn_scratch.items;
+        self.living_count -= doomed.len;
+
+        // Tick 0: despawned entities never match `Removed` (see `despawn`).
+        var low = components & ~overflow_bit;
+        while (low != 0) : (low &= low - 1) {
+            self.component_storages.items[@ctz(low)].?.removeMany(doomed, 0);
+        }
+        if (components & overflow_bit != 0) {
+            for (self.component_storages.items[overflow_bit_index..]) |maybe_storage| {
+                if (maybe_storage) |storage| storage.removeMany(doomed, 0);
+            }
+        }
     }
 
     /// Returns the number of living entities in the world.
@@ -1362,4 +1509,104 @@ test "a despawned entity's reused id does not match Removed in the same tick" {
     try std.testing.expect(!world.wasRemoved(reused, Health));
     var removed = world.query(.{root.filters.Removed(Health)});
     try std.testing.expect(removed.next() == null);
+}
+
+test "batch operations leave the world as the one-by-one calls would" {
+    const Position = struct { x: u32 };
+    const Velocity = struct { dx: u32 };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    var entities: [6]root.EntityId = undefined;
+    try world.spawnBatch(&entities, .{ Position{ .x = 1 }, Velocity{ .dx = 2 } });
+    try std.testing.expectEqual(@as(usize, 6), world.entityCount());
+    for (entities) |entity| {
+        try std.testing.expectEqual(@as(u32, 1), world.get(entity, Position).?.x);
+        try std.testing.expectEqual(@as(u32, 2), world.get(entity, Velocity).?.dx);
+    }
+
+    try world.removeComponents(entities[0..3], Velocity);
+    for (entities, 0..) |entity, i| try std.testing.expectEqual(i >= 3, world.hasComponent(entity, Velocity));
+
+    try world.addComponents(entities[0..2], Velocity{ .dx = 9 });
+    try std.testing.expectEqual(@as(u32, 9), world.get(entities[1], Velocity).?.dx);
+    try std.testing.expect(!world.hasComponent(entities[2], Velocity));
+
+    try world.despawnBatch(entities[0..4]);
+    try std.testing.expectEqual(@as(usize, 2), world.entityCount());
+    for (entities[0..4]) |entity| try std.testing.expect(!world.isAlive(entity));
+    // The survivors keep their components; a full query sees exactly them.
+    var count: usize = 0;
+    var query = world.query(.{ *const Position, *const Velocity });
+    while (query.next()) |view| {
+        try std.testing.expect(view.entity.id == entities[4].id or view.entity.id == entities[5].id);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "despawnBatch skips repeats and dead ids, and frees each id once" {
+    const Position = struct { x: u32 };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const a = try world.spawn(.{Position{ .x = 1 }});
+    const b = try world.spawn(.{Position{ .x = 2 }});
+    const gone = try world.spawn(.{});
+    world.despawn(gone);
+    const c = try world.spawn(.{Position{ .x = 3 }}); // reuses `gone`'s id
+
+    try world.despawnBatch(&.{ a, a, gone, b, a });
+    try std.testing.expectEqual(@as(usize, 1), world.entityCount());
+    try std.testing.expect(world.isAlive(c)); // the stale handle to its id didn't touch it
+    try std.testing.expectEqual(@as(u32, 3), world.get(c, Position).?.x);
+
+    // Each freed id is handed out once: two new entities get two different ids.
+    const x = try world.spawn(.{});
+    const y = try world.spawn(.{});
+    try std.testing.expect(x.id != y.id);
+}
+
+test "addComponents and removeComponents change nothing if any entity is dead" {
+    const Health = struct { hp: u32 };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const alive = try world.spawn(.{Health{ .hp = 1 }});
+    const dead = try world.spawn(.{});
+    world.despawn(dead);
+
+    try std.testing.expectError(error.EntityNotAlive, world.addComponents(&.{ alive, dead }, Health{ .hp = 5 }));
+    try std.testing.expectEqual(@as(u32, 1), world.get(alive, Health).?.hp);
+    try std.testing.expectError(error.EntityNotAlive, world.removeComponents(&.{ alive, dead }, Health));
+    try std.testing.expect(world.hasComponent(alive, Health));
+}
+
+test "batch adds and removes still run hooks" {
+    const Health = struct { hp: u32 };
+    const Count = struct {
+        var added: usize = 0;
+        var removed: usize = 0;
+        fn onAdd(_: *World, _: root.EntityId) void {
+            added += 1;
+        }
+        fn onRemove(_: *World, _: root.EntityId) void {
+            removed += 1;
+        }
+    };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    world.onAdd(Health, Count.onAdd);
+    world.onRemove(Health, Count.onRemove);
+
+    var entities: [3]root.EntityId = undefined;
+    try world.spawnBatch(&entities, .{Health{ .hp = 1 }});
+    try world.removeComponents(entities[0..2], Health);
+    try world.despawnBatch(&entities);
+    try std.testing.expectEqual(@as(usize, 3), Count.added);
+    try std.testing.expectEqual(@as(usize, 3), Count.removed);
 }
