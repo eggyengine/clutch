@@ -1,10 +1,11 @@
+//! Component storage: one sparse set per component type.
 const std = @import("std");
 const entity_mod = @import("entity.zig");
 const EntityId = entity_mod.EntityId;
 
-/// A change tick: the world's frame counter. 0 means "never"; the world starts at 1.
 // shortcut: u32 halves the tick arrays; after 2^32 ticks (over 2 years at 60 fps) a value left
 // untouched that whole time could read as added or changed again. Use u64 if worlds live that long.
+/// A change tick: the world's frame counter. 0 means "never"; the world starts at 1.
 pub const Tick = u32;
 
 /// When a value was added, and when it last changed (0 if never since it was added).

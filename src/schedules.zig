@@ -1,3 +1,4 @@
+//! Schedules: systems grouped into stages that the world runs in order.
 const std = @import("std");
 const world_mod = @import("world.zig");
 const EntityId = @import("entity.zig").EntityId;
@@ -5,6 +6,8 @@ const Query = world_mod.Query;
 const World = world_mod.World;
 const command = @import("command.zig");
 
+/// The built-in stages. `World.runAll` runs them in `primary_order`: init stages, then update
+/// stages, then deinit stages.
 pub const Stages = enum(u8) {
     PreInit,
     Init,
@@ -17,6 +20,7 @@ pub const Stages = enum(u8) {
     PostUpdate,
 };
 
+/// The order `World.runAll` runs the built-in stages in.
 pub const primary_order = [_]Stages{
     .PreInit,
     .Init,
@@ -29,22 +33,28 @@ pub const primary_order = [_]Stages{
     .PostDeinit,
 };
 
+/// Identifies a stage: a built-in one, or a custom one (by label or type), optionally
+/// running right after a parent stage.
 pub const ScheduleStage = struct {
     id: u64,
     parent_id: ?u64 = null,
 
+    /// A built-in stage.
     pub fn primary(primary_stage: Stages) ScheduleStage {
         return .{ .id = @intFromEnum(primary_stage) };
     }
 
+    /// A custom stage named by `label`, run with `World.runStage(label)`.
     pub fn custom(comptime label: []const u8) ScheduleStage {
         return .{ .id = customId(label) };
     }
 
+    /// A custom stage named by type `T`.
     pub fn customType(comptime T: type) ScheduleStage {
         return custom(@typeName(T));
     }
 
+    /// A custom stage named by type `T` that runs right after `parent_stage` whenever that runs.
     pub fn after(comptime parent_stage: anytype, comptime T: type) ScheduleStage {
         const parent = stage(parent_stage);
         return .{
@@ -54,6 +64,7 @@ pub const ScheduleStage = struct {
     }
 };
 
+/// Short for `ScheduleStage`.
 pub const Stage = ScheduleStage;
 
 /// Converts all valid schedule values to a `ScheduleStage`.
@@ -100,10 +111,15 @@ fn customId(comptime label: []const u8) u64 {
     return (@as(u64, 1) << 63) | (std.hash.Wyhash.hash(0, label) & (std.math.maxInt(u64) >> 1));
 }
 
+/// A group of `systems` (a tuple of functions) for `schedule_stage`, registered with
+/// `World.addSchedule`. Each system runs in order; its parameters are filled from the world:
+/// `Query(...)`, `Res(T)`/`ResMut(T)` (or `*const T`/`*T`) for resources, and `Commands`.
+/// Conflicting access (two mutable uses of one component or resource) is a compile error.
 pub fn Schedule(comptime schedule_stage: anytype, comptime systems: anytype) type {
     return struct {
         pub const stage_value = stage(schedule_stage);
 
+        /// Run every system in order. Each system's `Commands` apply as soon as it returns.
         pub fn run(world: *World) !void {
             inline for (systems) |system| {
                 try runSystem(world, system);

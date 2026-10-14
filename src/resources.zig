@@ -1,3 +1,4 @@
+//! Resources: one value per type, shared by the whole world (time, settings, input).
 /// A more typed version of `*const T`, allowing viewing-only access (no mutation) for resources.
 pub fn Res(comptime T: type) type {
     return *const T;

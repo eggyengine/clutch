@@ -1,0 +1,21 @@
+# Builds the full programs in the Docusaurus guides (docs/examples/check.sh), so an API change
+# that breaks the docs fails CI instead of shipping.
+name: Docs examples
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # Zig 0.16 fetches .zip dependencies into the cache's tmp/ without creating it first.
+      - run: mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
+      - run: docs/examples/check.sh

@@ -1,3 +1,4 @@
+//! The world, queries and event readers.
 const std = @import("std");
 const root = @import("root.zig");
 

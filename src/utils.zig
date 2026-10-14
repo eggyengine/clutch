@@ -1,3 +1,4 @@
+//! Helpers for spawning entities.
 const std = @import("std");
 
 /// A bundle of components.
@@ -33,6 +34,7 @@ pub fn Bundle(comptime defaults: anytype) type {
     };
 
     return struct {
+        /// The defaults, as a tuple ready for `World.spawn`.
         pub fn init() Components {
             var result: Components = undefined;
             inline for (defaults, 0..) |default, index| {
@@ -41,6 +43,7 @@ pub fn Bundle(comptime defaults: anytype) type {
             return result;
         }
 
+        /// The defaults with some replaced: each value in `overrides` replaces the default of its type.
         pub fn with(overrides: anytype) Components {
             var result = init();
             inline for (defaults, 0..) |default, index| {

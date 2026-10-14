@@ -1,3 +1,4 @@
+//! Query filters: terms that narrow a query without giving access to the component.
 const std = @import("std");
 
 /// Specifies the type of filter.
@@ -50,6 +51,7 @@ pub fn With(comptime T: type) type {
     };
 }
 
+/// Whether query term `Term` is a `With` filter.
 pub fn isWith(comptime Term: type) bool {
     return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .with;
 }
@@ -87,6 +89,7 @@ pub fn Without(comptime T: type) type {
     };
 }
 
+/// Whether query term `Term` is a `Without` filter.
 pub fn isWithout(comptime Term: type) bool {
     return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .without;
 }
@@ -130,6 +133,7 @@ pub fn Added(comptime T: type) type {
     };
 }
 
+/// Whether query term `Term` is a `Added` filter.
 pub fn isAdded(comptime Term: type) bool {
     return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .added;
 }
@@ -176,6 +180,7 @@ pub fn Changed(comptime T: type) type {
     };
 }
 
+/// Whether query term `Term` is a `Changed` filter.
 pub fn isChanged(comptime Term: type) bool {
     return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .changed;
 }
@@ -193,6 +198,7 @@ pub fn Removed(comptime T: type) type {
     };
 }
 
+/// Whether query term `Term` is a `Removed` filter.
 pub fn isRemoved(comptime Term: type) bool {
     return isFilterStruct(Term) and @hasDecl(Term, "kind") and Term.kind == .removed;
 }

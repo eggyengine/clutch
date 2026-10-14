@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const mod = b.addModule("clutch", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    addDocs(b, mod);
 
     // Benchmarks always build ReleaseFast: debug timings say nothing about real use.
     const bench = b.addExecutable(.{
@@ -72,4 +73,12 @@ fn defaultTestRunner(b: *std.Build) std.Build.Step.Compile.TestRunner {
         .path = .{ .cwd_relative = path },
         .mode = .simple,
     };
+}
+
+/// `zig build docs`: Zig's HTML API reference for `mod` in zig-out/docs, which
+/// .github/workflows/docs.yml publishes under api/.
+fn addDocs(b: *std.Build, mod: *std.Build.Module) void {
+    const docs = b.addObject(.{ .name = "clutch", .root_module = mod });
+    const install = b.addInstallDirectory(.{ .source_dir = docs.getEmittedDocs(), .install_dir = .prefix, .install_subdir = "docs" });
+    b.step("docs", "Build the API docs into zig-out/docs").dependOn(&install.step);
 }

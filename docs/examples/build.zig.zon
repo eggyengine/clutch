@@ -1,0 +1,10 @@
+.{
+    .name = .clutch_examples,
+    .version = "0.0.0",
+    .fingerprint = 0x1a300f53873750c8,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .clutch = .{ .path = "../.." },
+    },
+    .paths = .{""},
+}
