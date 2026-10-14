@@ -7,28 +7,39 @@ const EntityId = entity_mod.EntityId;
 // untouched that whole time could read as added or changed again. Use u64 if worlds live that long.
 pub const Tick = u32;
 
+/// When a value was added, and when it last changed (0 if never since it was added).
+pub const Ticks = struct { added: Tick, changed: Tick };
+
+/// One entity id's entry in a storage's sparse array.
+const Slot = struct {
+    /// The entity's position in the dense arrays, or `absent`.
+    index: u32,
+    /// The tick the entity's value was last removed on, or 0.
+    removed: Tick,
+};
+
 /// Marks an entity id with no value in a `ComponentStorage`.
 const absent = std.math.maxInt(u32);
+const empty_slot = Slot{ .index = absent, .removed = 0 };
 
 /// A sparse set holding one component type, as EnTT and pico_ecs store them.
 ///
-/// The dense arrays `entities`, `values`, `added_ticks` and `changed_ticks` are kept in
-/// lockstep and stay packed: `entities.items[i]` owns `values.items[i]`. `sparse`, indexed by
-/// entity id, holds each entity's dense index (or `absent`), so every lookup is an array read.
+/// The dense arrays `entities`, `values` and `ticks` are kept in lockstep and stay packed:
+/// `entities.items[i]` owns `values.items[i]`. `sparse`, indexed by entity id, holds each
+/// entity's dense index, so every lookup is an array read.
+///
+/// Data used together is stored together (ticks in one array, an id's index and removal tick
+/// in another): each removal then touches fewer cache lines, which matters once a world has
+/// several storages. `entities` and `values` stay separate so queries stream only what they use.
 pub fn ComponentStorage(comptime T: type) type {
     return struct {
         const Self = @This();
 
         entities: std.ArrayList(EntityId) = .empty,
         values: std.ArrayList(T) = .empty,
-        /// The tick each value was added on.
-        added_ticks: std.ArrayList(Tick) = .empty,
-        /// The tick each value last changed on (0 if never since it was added).
-        changed_ticks: std.ArrayList(Tick) = .empty,
-        /// Entity id -> dense index, or `absent`.
-        sparse: std.ArrayList(u32) = .empty,
-        /// Entity id -> the tick its value was last removed on, or 0.
-        removed_ticks: std.ArrayList(Tick) = .empty,
+        ticks: std.ArrayList(Ticks) = .empty,
+        /// Entity id -> `Slot`.
+        sparse: std.ArrayList(Slot) = .empty,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             _ = allocator;
@@ -38,10 +49,8 @@ pub fn ComponentStorage(comptime T: type) type {
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.entities.deinit(allocator);
             self.values.deinit(allocator);
-            self.added_ticks.deinit(allocator);
-            self.changed_ticks.deinit(allocator);
+            self.ticks.deinit(allocator);
             self.sparse.deinit(allocator);
-            self.removed_ticks.deinit(allocator);
         }
 
         /// Add a value for `entity`, or replace (and mark changed) the value it already has.
@@ -53,7 +62,7 @@ pub fn ComponentStorage(comptime T: type) type {
         pub fn insert(self: *Self, allocator: std.mem.Allocator, entity: EntityId, value: T, tick: Tick) !bool {
             if (self.denseIndex(entity)) |index| {
                 self.values.items[index] = value;
-                self.changed_ticks.items[index] = tick;
+                self.ticks.items[index].changed = tick;
                 return false;
             }
 
@@ -62,43 +71,49 @@ pub fn ComponentStorage(comptime T: type) type {
             if (self.entities.items.len == self.entities.capacity) try self.growDense(allocator);
 
             const index = self.entities.items.len;
-            self.sparse.items[entity.id] = @intCast(index);
+            self.sparse.items[entity.id].index = @intCast(index);
             self.entities.items.len += 1;
             self.values.items.len += 1;
-            self.added_ticks.items.len += 1;
-            self.changed_ticks.items.len += 1;
+            self.ticks.items.len += 1;
             self.entities.items[index] = entity;
             self.values.items[index] = value;
-            self.added_ticks.items[index] = tick;
-            self.changed_ticks.items[index] = 0;
+            self.ticks.items[index] = .{ .added = tick, .changed = 0 };
             return true;
         }
 
-        /// Make `id` a valid index of `sparse` and `removed_ticks` (sized together, so
-        /// `remove` never allocates).
-        fn growSparseTo(self: *Self, allocator: std.mem.Allocator, id: u32) !void {
-            @branchHint(.cold);
-            try growSparse(u32, &self.sparse, allocator, id, absent);
-            try growSparse(Tick, &self.removed_ticks, allocator, id, 0);
+        /// Allocate room for `count` values, for entity ids below `count`, so adding that many
+        /// never reallocates.
+        pub fn reserve(self: *Self, allocator: std.mem.Allocator, count: usize) !void {
+            try self.entities.ensureTotalCapacityPrecise(allocator, count);
+            try self.values.ensureTotalCapacityPrecise(allocator, count);
+            try self.ticks.ensureTotalCapacityPrecise(allocator, count);
+            try self.sparse.ensureTotalCapacityPrecise(allocator, count);
         }
 
-        /// Give the four dense arrays room for at least one more value, all with the same
-        /// capacity, so `add` checks one of them. Leaves the storage unchanged on failure.
+        /// Make `id` a valid index of `sparse`, doubling: ids usually arrive in order.
+        fn growSparseTo(self: *Self, allocator: std.mem.Allocator, id: u32) !void {
+            @branchHint(.cold);
+            if (id >= self.sparse.capacity) {
+                try self.sparse.ensureTotalCapacityPrecise(allocator, @max(@as(usize, id) + 1, self.sparse.capacity * 2, 64));
+            }
+            self.sparse.appendNTimesAssumeCapacity(empty_slot, id + 1 - self.sparse.items.len);
+        }
+
+        /// Give the dense arrays room for at least one more value, all with the same capacity,
+        /// so `insert` checks one of them. Leaves the storage unchanged on failure.
         fn growDense(self: *Self, allocator: std.mem.Allocator) !void {
             @branchHint(.cold);
-            const len = self.entities.items.len;
             // Doubling: fewer reallocations, and half the copying of 1.5x growth.
-            const capacity = @max(8, len * 2);
+            const capacity = @max(8, self.entities.items.len * 2);
             try self.entities.ensureTotalCapacityPrecise(allocator, capacity);
             try self.values.ensureTotalCapacityPrecise(allocator, capacity);
-            try self.added_ticks.ensureTotalCapacityPrecise(allocator, capacity);
-            try self.changed_ticks.ensureTotalCapacityPrecise(allocator, capacity);
+            try self.ticks.ensureTotalCapacityPrecise(allocator, capacity);
         }
 
         /// The dense index of `entity`'s value, or null if it has none.
         pub inline fn denseIndex(self: *const Self, entity: EntityId) ?u32 {
             if (entity.id >= self.sparse.items.len) return null;
-            const index = self.sparse.items[entity.id];
+            const index = self.sparse.items[entity.id].index;
             return if (index == absent) null else index;
         }
 
@@ -112,55 +127,45 @@ pub fn ComponentStorage(comptime T: type) type {
             return self.denseIndex(entity) != null;
         }
 
-        /// Remove `entity`'s value, if any, by moving the last value into its slot.
+        /// Remove `entity`'s value, if any, by moving the last value into its slot. Never allocates.
         pub fn remove(self: *Self, entity: EntityId, tick: Tick) void {
             const index = self.denseIndex(entity) orelse return;
-            const last = self.values.items.len - 1;
+            const last = self.entities.items.len - 1;
             if (index != last) {
                 const moved = self.entities.items[last];
                 self.entities.items[index] = moved;
                 self.values.items[index] = self.values.items[last];
-                self.added_ticks.items[index] = self.added_ticks.items[last];
-                self.changed_ticks.items[index] = self.changed_ticks.items[last];
-                self.sparse.items[moved.id] = index;
+                self.ticks.items[index] = self.ticks.items[last];
+                self.sparse.items[moved.id].index = index;
             }
-            _ = self.entities.pop();
-            _ = self.values.pop();
-            _ = self.added_ticks.pop();
-            _ = self.changed_ticks.pop();
-            self.sparse.items[entity.id] = absent;
-            self.removed_ticks.items[entity.id] = tick;
+            self.entities.items.len = last;
+            self.values.items.len = last;
+            self.ticks.items.len = last;
+            self.sparse.items[entity.id] = .{ .index = absent, .removed = tick };
         }
 
         pub fn markChanged(self: *Self, entity: EntityId, tick: Tick) void {
             const index = self.denseIndex(entity) orelse return;
-            self.changed_ticks.items[index] = tick;
+            self.ticks.items[index].changed = tick;
         }
 
         pub fn wasAdded(self: *const Self, entity: EntityId, tick: Tick) bool {
             const index = self.denseIndex(entity) orelse return false;
-            return self.added_ticks.items[index] == tick;
+            return self.ticks.items[index].added == tick;
         }
 
         pub fn wasChanged(self: *const Self, entity: EntityId, tick: Tick) bool {
             const index = self.denseIndex(entity) orelse return false;
-            return self.changed_ticks.items[index] == tick;
+            return self.ticks.items[index].changed == tick;
         }
 
         /// Whether `entity` lost its value on `tick` and hasn't been given one again since.
         pub fn wasRemoved(self: *const Self, entity: EntityId, tick: Tick) bool {
-            if (self.has(entity) or entity.id >= self.removed_ticks.items.len) return false;
-            return self.removed_ticks.items[entity.id] == tick;
+            if (entity.id >= self.sparse.items.len) return false;
+            const slot = self.sparse.items[entity.id];
+            return slot.index == absent and slot.removed == tick;
         }
     };
-}
-
-/// Grow `list` so `id` is a valid index, filling new slots with `fill`.
-fn growSparse(comptime E: type, list: *std.ArrayList(E), allocator: std.mem.Allocator, id: u32, fill: E) !void {
-    if (id < list.items.len) return;
-    // Doubling, as for the dense arrays: ids usually arrive in order, one past the end.
-    if (id >= list.capacity) try list.ensureTotalCapacityPrecise(allocator, @max(@as(usize, id) + 1, list.capacity * 2, 64));
-    list.appendNTimesAssumeCapacity(fill, id + 1 - list.items.len);
 }
 
 test "component storage adds and gets values" {
@@ -230,4 +235,18 @@ test "component storage tracks added and changed ticks per value" {
 
     storage.markChanged(entity, 4);
     try std.testing.expect(storage.wasChanged(entity, 4));
+}
+
+test "a value added back after removal is no longer reported as removed" {
+    const Health = struct { hp: f32 };
+
+    var storage = ComponentStorage(Health).init(std.testing.allocator);
+    defer storage.deinit(std.testing.allocator);
+
+    const entity = EntityId.init(2, 0);
+    try storage.add(std.testing.allocator, entity, .{ .hp = 1 }, 1);
+    storage.remove(entity, 2);
+    try std.testing.expect(storage.wasRemoved(entity, 2));
+    try storage.add(std.testing.allocator, entity, .{ .hp = 5 }, 2);
+    try std.testing.expect(!storage.wasRemoved(entity, 2));
 }

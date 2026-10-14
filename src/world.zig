@@ -56,7 +56,7 @@ const unassigned_type_index = std.math.maxInt(u32);
 /// A small number for component type `T`, the same in every world: the position of its
 /// storage in `World.component_storages`, so finding a storage is an array read, not a hash.
 /// Assigned on first use; safe to call from several threads.
-fn typeIndex(comptime T: type) u32 {
+inline fn typeIndex(comptime T: type) u32 {
     const Slot = struct {
         const Component = T; // one `Slot` per component type
         var index = std.atomic.Value(u32).init(unassigned_type_index);
@@ -106,6 +106,9 @@ fn deinitTypedResource(comptime T: type, ptr: *anyopaque, allocator: std.mem.All
     allocator.destroy(resource);
 }
 
+/// One entity id's generation (bumped on despawn, so stale handles stop matching) and liveness.
+const EntitySlot = struct { generation: u32, alive: bool };
+
 /// Stores all components and entities using the ECS paradigm.
 ///
 /// Typically should not be received as an argument in a system. Use `clutch.Command` instead.
@@ -122,8 +125,8 @@ pub const World = struct {
 
     allocator: std.mem.Allocator,
 
-    generations: std.ArrayList(u32),
-    alive: std.ArrayList(bool),
+    /// Indexed by entity id: generation and liveness together, so `isAlive` reads one cache line.
+    slots: std.ArrayList(EntitySlot),
     free_ids: std.ArrayList(u32),
     living_count: usize = 0,
     /// The current change tick: `Added`, `Changed` and `Removed` match what happened during it.
@@ -148,8 +151,7 @@ pub const World = struct {
     pub fn init(allocator: std.mem.Allocator) World {
         return .{
             .allocator = allocator,
-            .generations = .empty,
-            .alive = .empty,
+            .slots = .empty,
             .free_ids = .empty,
             .component_storages = .empty,
             .system_commands = .init(allocator),
@@ -215,15 +217,18 @@ pub const World = struct {
         self.parent_by_child.deinit();
 
         self.system_commands.deinit();
-        self.generations.deinit(self.allocator);
-        self.alive.deinit(self.allocator);
+        self.slots.deinit(self.allocator);
         self.free_ids.deinit(self.allocator);
     }
 
-    fn storageFor(self: *World, comptime T: type) !*root.storage.ComponentStorage(T) {
-        const Storage = root.storage.ComponentStorage(T);
+    inline fn storageFor(self: *World, comptime T: type) !*root.storage.ComponentStorage(T) {
         if (self.existingStorage(T)) |storage| return storage;
+        return self.createStorage(T);
+    }
 
+    fn createStorage(self: *World, comptime T: type) !*root.storage.ComponentStorage(T) {
+        @branchHint(.cold);
+        const Storage = root.storage.ComponentStorage(T);
         const index = typeIndex(T);
         if (index >= self.component_storages.items.len) {
             try self.component_storages.appendNTimes(self.allocator, null, index + 1 - self.component_storages.items.len);
@@ -286,7 +291,7 @@ pub const World = struct {
         return @ptrCast(@alignCast(erased.ptr));
     }
 
-    fn existingStorage(self: *World, comptime T: type) ?*root.storage.ComponentStorage(T) {
+    inline fn existingStorage(self: *World, comptime T: type) ?*root.storage.ComponentStorage(T) {
         const index = typeIndex(T);
         if (index >= self.component_storages.items.len) return null;
         const erased = self.component_storages.items[index] orelse return null;
@@ -327,18 +332,31 @@ pub const World = struct {
     fn createEntity(self: *World) !root.EntityId {
         if (self.free_ids.items.len > 0) {
             const id = self.free_ids.pop().?;
-            self.alive.items[@intCast(id)] = true;
+            self.slots.items[@intCast(id)].alive = true;
             self.living_count += 1;
 
-            return root.EntityId.init(id, self.generations.items[@intCast(id)]);
+            return root.EntityId.init(id, self.slots.items[@intCast(id)].generation);
         }
 
-        const id: u32 = @intCast(self.generations.items.len);
-        try self.generations.append(self.allocator, 0);
-        try self.alive.append(self.allocator, true);
+        const id: u32 = @intCast(self.slots.items.len);
+        try self.slots.append(self.allocator, .{ .generation = 0, .alive = true });
         self.living_count += 1;
 
         return root.EntityId.init(id, 0);
+    }
+
+    /// Allocate room for `count` entities in total, so spawning (and despawning) that many
+    /// never reallocates. Optional: the world grows on its own.
+    pub fn reserveEntities(self: *World, count: usize) !void {
+        try self.slots.ensureTotalCapacityPrecise(self.allocator, count);
+        try self.free_ids.ensureTotalCapacityPrecise(self.allocator, count);
+    }
+
+    /// Allocate room for `count` values of component `T` (for entity ids below `count`), so
+    /// adding that many never reallocates. Optional: storages grow on their own.
+    pub fn reserve(self: *World, comptime T: type, count: usize) !void {
+        const storage = try self.storageFor(T);
+        try storage.reserve(self.allocator, count);
     }
 
     /// Spawns a new entity with the given components.
@@ -369,9 +387,11 @@ pub const World = struct {
         if (!self.isAlive(entity)) return error.EntityNotAlive;
 
         const storage = self.existingStorage(T) orelse return;
-        if (!storage.has(entity)) return;
-
-        self.runHooks(&self.on_remove_hooks, typeIndex(T), entity);
+        // Hooks see the component before it goes, so only they need the separate check;
+        // `remove` already ignores entities without one.
+        if (self.on_remove_hooks.count() != 0 and storage.has(entity)) {
+            self.runHooks(&self.on_remove_hooks, typeIndex(T), entity);
+        }
         storage.remove(entity, self.change_tick);
     }
 
@@ -654,11 +674,11 @@ pub const World = struct {
     }
 
     /// Checks the generation validity of an entity and ensures that the latest generation matches the entity's generation.
-    pub fn isAlive(self: *World, entity: root.EntityId) bool {
-        if (entity.id >= self.alive.items.len) return false;
+    pub inline fn isAlive(self: *World, entity: root.EntityId) bool {
+        if (entity.id >= self.slots.items.len) return false;
         const index = entity.index();
-        return self.alive.items[index] and
-            self.generations.items[index] == entity.generation;
+        const slot = self.slots.items[index];
+        return slot.alive and slot.generation == entity.generation;
     }
 
     /// Despawns an entity, marking it as dead and freeing its ID for reuse.
@@ -694,8 +714,8 @@ pub const World = struct {
         }
 
         const index = entity.index();
-        self.alive.items[index] = false;
-        self.generations.items[index] += 1;
+        self.slots.items[index].alive = false;
+        self.slots.items[index].generation += 1;
         self.free_ids.append(self.allocator, entity.id) catch unreachable;
         self.living_count -= 1;
     }
@@ -708,10 +728,10 @@ pub const World = struct {
     /// Despawns all living entities while keeping resources and registered hooks/schedules.
     pub fn clear(self: *World) void {
         var index: usize = 0;
-        while (index < self.alive.items.len) : (index += 1) {
-            if (!self.alive.items[index]) continue;
+        while (index < self.slots.items.len) : (index += 1) {
+            if (!self.slots.items[index].alive) continue;
 
-            const entity = root.EntityId.init(@intCast(index), self.generations.items[index]);
+            const entity = root.EntityId.init(@intCast(index), self.slots.items[index].generation);
             self.despawn(entity);
         }
     }
@@ -822,12 +842,12 @@ pub fn Query(comptime terms: anytype) type {
             }
 
             const world = self.world;
-            while (self.index < world.generations.items.len) {
+            while (self.index < world.slots.items.len) {
                 const id: u32 = @intCast(self.index);
-                const entity = root.EntityId.init(id, world.generations.items[self.index]);
+                const entity = root.EntityId.init(id, world.slots.items[self.index].generation);
                 self.index += 1;
                 var indices: Indices = undefined;
-                if (world.alive.items[self.index - 1] and self.matches(entity, &indices)) return self.view(entity, indices);
+                if (world.slots.items[self.index - 1].alive and self.matches(entity, &indices)) return self.view(entity, indices);
             }
             return null;
         }
@@ -1267,4 +1287,22 @@ test "query views read each entity's own components after removals reshuffle sto
         matched += 1;
     }
     try std.testing.expectEqual(@as(usize, 5), matched); // all but 0, 3 and 5
+}
+
+test "reserved worlds spawn and add without reallocating" {
+    const Position = struct { x: f32 };
+
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+    try world.reserveEntities(64);
+    try world.reserve(Position, 64);
+    const storage = world.existingStorage(Position).?;
+    const values_before = storage.values.items.ptr;
+    const slots_before = world.slots.items.ptr;
+
+    for (0..64) |i| _ = try world.spawn(.{Position{ .x = @floatFromInt(i) }});
+
+    try std.testing.expectEqual(values_before, storage.values.items.ptr);
+    try std.testing.expectEqual(slots_before, world.slots.items.ptr);
+    try std.testing.expectEqual(@as(usize, 64), world.entityCount());
 }

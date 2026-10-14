@@ -23,6 +23,7 @@ const Case = struct {
 
 const cases = [_]Case{
     .{ .name = "spawn (2 components)", .setup = setupNothing, .run = spawnTwo },
+    .{ .name = "spawn (2 components, reserved)", .setup = setupReserved, .run = spawnTwo },
     .{ .name = "get", .setup = setupMoving, .run = getEach },
     .{ .name = "query 1 component", .setup = setupMoving, .run = queryOne },
     .{ .name = "query 2 components", .setup = setupMoving, .run = queryTwo },
@@ -30,6 +31,7 @@ const cases = [_]Case{
     .{ .name = "add + remove component", .setup = setupMoving, .run = addRemove },
     .{ .name = "add component (cold storage)", .setup = setupMoving, .run = addHealth },
     .{ .name = "add component (warm storage)", .setup = setupWarmHealth, .run = addHealth },
+    .{ .name = "add component (reserved)", .setup = setupReservedHealth, .run = addHealth },
     .{ .name = "remove component", .setup = setupWithHealth, .run = removeHealth },
     .{ .name = "markChanged 10% + query Changed", .setup = setupMoving, .run = changedTenth },
     .{ .name = "commands: add component", .setup = setupMoving, .run = commandAdd },
@@ -63,6 +65,18 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn setupNothing(_: *clutch.World, _: []clutch.EntityId) !void {}
+
+/// What a game that knows its size would do up front, as pico_ecs requires.
+fn setupReserved(world: *clutch.World, entities: []clutch.EntityId) !void {
+    try world.reserveEntities(entities.len);
+    try world.reserve(Position, entities.len);
+    try world.reserve(Velocity, entities.len);
+}
+
+fn setupReservedHealth(world: *clutch.World, entities: []clutch.EntityId) !void {
+    try setupMoving(world, entities);
+    try world.reserve(Health, entities.len);
+}
 
 fn setupMoving(world: *clutch.World, entities: []clutch.EntityId) !void {
     for (entities) |*entity| entity.* = try world.spawn(.{ Position{}, Velocity{} });
