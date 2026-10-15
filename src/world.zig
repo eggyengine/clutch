@@ -637,6 +637,15 @@ pub const World = struct {
         }
     }
 
+    /// Makes `child` a child of `parent` at `index` among its children (clamped to their count,
+    /// so `maxInt(usize)` puts it last). Children keep the order they are placed in.
+    pub fn insertChild(self: *World, parent: root.EntityId, child: root.EntityId, index: usize) !void {
+        try self.setSingleParent(child, parent);
+        const list = self.children_by_parent.getPtr(parent.id).?;
+        const moved = list.pop().?;
+        list.insertAssumeCapacity(@min(index, list.items.len), moved);
+    }
+
     fn setSingleParent(self: *World, child: root.EntityId, parent: root.EntityId) !void {
         if (!self.isAlive(child) or !self.isAlive(parent)) return error.EntityNotAlive;
         if (root.EntityId.eql(child, parent)) return error.InvalidHierarchy;
@@ -676,10 +685,11 @@ pub const World = struct {
         _ = self.parent_by_child.remove(child.id);
 
         const child_list = self.children_by_parent.getPtr(parent.id) orelse return;
+        // Ordered, so the siblings left keep their order.
         var index: usize = 0;
         while (index < child_list.items.len) : (index += 1) {
             if (root.EntityId.eql(child_list.items[index], child)) {
-                _ = child_list.swapRemove(index);
+                _ = child_list.orderedRemove(index);
                 break;
             }
         }
@@ -922,6 +932,9 @@ pub const World = struct {
             const entity = root.EntityId.init(@intCast(index), self.slots.items[index].generation);
             self.despawn(entity);
         }
+        // Lowest id first from here (`free_ids` pops from the end), so entities spawned into the
+        // cleared world take ids in the order they are spawned.
+        std.mem.sort(u32, self.free_ids.items, {}, std.sort.desc(u32));
     }
 };
 
@@ -1430,6 +1443,42 @@ test "world hierarchy removes parent links" {
     try std.testing.expect(world.getParent(child) == null);
     var children = world.children(parent);
     try std.testing.expect(children.next() == null);
+}
+
+test "children keep their order, and can be placed at an index" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    const parent = try world.spawn(.{});
+    const a = try world.spawn(.{});
+    const b = try world.spawn(.{});
+    const c = try world.spawn(.{});
+    try world.setParent(parent, .{ a, b, c });
+
+    // Taking the first away leaves the rest in order.
+    world.removeParent(a);
+    try expectChildren(&world, parent, &.{ b, c });
+    // Put back first, then the last moved between the others.
+    try world.insertChild(parent, a, 0);
+    try world.insertChild(parent, c, 1);
+    try expectChildren(&world, parent, &.{ a, c, b });
+    try world.insertChild(parent, a, std.math.maxInt(usize));
+    try expectChildren(&world, parent, &.{ c, b, a });
+}
+
+fn expectChildren(world: *World, parent: root.EntityId, expected: []const root.EntityId) !void {
+    var it = world.children(parent);
+    for (expected) |child| try std.testing.expectEqual(child, it.next().?);
+    try std.testing.expect(it.next() == null);
+}
+
+test "after clear, entities take ids in the order they are spawned" {
+    var world = World.init(std.testing.allocator);
+    defer world.deinit();
+
+    for (0..4) |_| _ = try world.spawn(.{});
+    world.clear();
+    for (0..4) |expected| try std.testing.expectEqual(@as(u32, @intCast(expected)), (try world.spawn(.{})).id);
 }
 
 test "despawning entities mid-query still visits every entity exactly once" {
