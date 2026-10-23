@@ -952,7 +952,7 @@ pub fn Query(comptime terms: anytype) type {
     const Storages = comptime blk: {
         var types: [terms.len]type = undefined;
         for (terms, 0..) |term, i| types[i] = ?*root.storage.ComponentStorage(termComponent(term));
-        break :blk std.meta.Tuple(&types);
+        break :blk @Tuple(&types);
     };
 
     // Per term, the matched entity's position in that term's storage (set for component terms).
@@ -1489,14 +1489,14 @@ test "despawning entities mid-query still visits every entity exactly once" {
 
     for (0..10) |i| _ = try world.spawn(.{Position{ .x = @intCast(i) }});
 
-    var seen = [_]u32{0} ** 10;
+    var seen: [10]u32 = @splat(0);
     var query = world.query(.{*const Position});
     while (query.next()) |view| {
         seen[view.get(*const Position).x] += 1;
         world.despawn(view.entity);
     }
 
-    try std.testing.expectEqualSlices(u32, &([_]u32{1} ** 10), &seen);
+    try std.testing.expectEqual(@as([10]u32, @splat(1)), seen);
     try std.testing.expectEqual(@as(usize, 0), world.entityCount());
 }
 

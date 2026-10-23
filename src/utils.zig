@@ -30,7 +30,7 @@ pub fn Bundle(comptime defaults: anytype) type {
         for (defaults, 0..) |default, index| {
             types[index] = @TypeOf(default);
         }
-        break :blk std.meta.Tuple(&types);
+        break :blk @Tuple(&types);
     };
 
     return struct {
