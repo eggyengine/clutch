@@ -7,19 +7,19 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("clutch", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
     addDocs(b, mod);
 
-    // Benchmarks always build ReleaseFast: debug timings say nothing about real use.
+    // Benchmarks always build `.fast`: debug timings say nothing about real use.
     const bench = b.addExecutable(.{
         .name = "clutch-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{.{ .name = "clutch", .module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = .ReleaseFast }) }},
+            .optimize = .fast,
+            .imports = &.{.{ .name = "clutch", .module = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = .fast }) }},
         }),
     });
     const run_bench = b.addRunArtifact(bench);
     run_bench.addPassthruArgs();
-    b.step("bench", "Time clutch's common operations (ReleaseFast); `-- <count>` sets the entity count").dependOn(&run_bench.step);
+    b.step("bench", "Time clutch's common operations (`.fast`); `-- <count>` sets the entity count").dependOn(&run_bench.step);
 
     // root.zig's test block reaches every file's tests.
     const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = mod }));

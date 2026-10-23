@@ -1,4 +1,4 @@
-//! `zig build bench`: times clutch's common operations on a large world, always in ReleaseFast.
+//! `zig build bench`: times clutch's common operations on a large world, always optimized for `.fast`.
 //! Each case runs `runs` times on fresh data; the fastest run is reported, as ns per entity.
 const std = @import("std");
 const clutch = @import("clutch");
