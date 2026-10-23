@@ -59,7 +59,7 @@ pub const Bundle = utils.Bundle;
 pub const CommandBuffer = command.CommandBuffer;
 pub const Commands = command.Commands;
 
-test { // idk if this even works
+test {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(examples);
 }

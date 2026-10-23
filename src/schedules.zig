@@ -41,7 +41,7 @@ pub const ScheduleStage = struct {
 
     /// A built-in stage.
     pub fn primary(primary_stage: Stages) ScheduleStage {
-        return .{ .id = @intFromEnum(primary_stage) };
+        return .{ .id = @backingInt(primary_stage) };
     }
 
     /// A custom stage named by `label`, run with `World.runStage(label)`.
@@ -130,12 +130,12 @@ pub fn Schedule(comptime schedule_stage: anytype, comptime systems: anytype) typ
 
 fn runSystem(world: *World, comptime system: anytype) !void {
     const info = @typeInfo(@TypeOf(system)).@"fn";
-    comptime validateSystemAccess(info.params);
+    comptime validateSystemAccess(info.param_types);
 
-    try runSystemWithArgs(world, system, info.params);
+    try runSystemWithArgs(world, system, info.param_types);
 }
 
-fn runSystemWithArgs(world: *World, comptime system: anytype, comptime params: []const std.builtin.Type.Fn.Param) !void {
+fn runSystemWithArgs(world: *World, comptime system: anytype, comptime params: []const ?type) !void {
     const needs_commands = comptime systemHasCommandsParam(params);
     // The world's buffer, unless a system further up the stack (one that ran this stage
     // itself) still has commands queued in it; then a buffer of our own.
@@ -150,17 +150,9 @@ fn runSystemWithArgs(world: *World, comptime system: anytype, comptime params: [
     // A failed system's commands are dropped, as they were when each run had its own buffer.
     errdefer if (needs_commands) command_buffer.clearRetainingCapacity();
 
-    const ArgTypes = comptime blk: {
-        var types: [params.len]type = undefined;
-        for (params, 0..) |param, i| {
-            types[i] = param.type orelse @compileError("system arguments must have concrete types");
-        }
-        break :blk types;
-    };
-
-    var args: std.meta.Tuple(&ArgTypes) = undefined;
-    inline for (params, 0..) |param, i| {
-        args[i] = try systemArg(world, if (needs_commands) command_buffer else null, param.type.?);
+    var args: std.meta.ArgsTuple(@TypeOf(system)) = undefined;
+    inline for (params, 0..) |Param, i| {
+        args[i] = try systemArg(world, if (needs_commands) command_buffer else null, Param.?);
     }
 
     try @call(.auto, system, args);
@@ -196,9 +188,9 @@ fn systemArg(world: *World, command_buffer: ?*command.CommandBuffer, comptime Pa
     }
 }
 
-fn systemHasCommandsParam(comptime params: []const std.builtin.Type.Fn.Param) bool {
-    for (params) |param| {
-        if (isCommandsParam(param.type.?)) return true;
+fn systemHasCommandsParam(comptime params: []const ?type) bool {
+    for (params) |Param| {
+        if (isCommandsParam(Param.?)) return true;
     }
     return false;
 }
@@ -210,13 +202,13 @@ fn isCommandsParam(comptime Param: type) bool {
     };
 }
 
-fn validateSystemAccess(comptime params: []const std.builtin.Type.Fn.Param) void {
+fn validateSystemAccess(comptime params: []const ?type) void {
     inline for (params, 0..) |left, left_index| {
-        const Left = left.type.?;
+        const Left = left.?;
         validateParamSelfAccess(Left);
 
         inline for (params[0..left_index]) |right| {
-            validateParamPairAccess(Left, right.type.?);
+            validateParamPairAccess(Left, right.?);
         }
     }
 }
