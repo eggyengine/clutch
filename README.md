@@ -1,5 +1,8 @@
 # clutch
 
+> [!NOTE]
+> This repository has migrated to [git.tirbo.fish/eggy/clutch](https://git.tirbo.fish/eggy/clutch).
+
 clutch is an ECS system (named after a group of eggs) written in Zig, and inspired by bevy_ecs
 
 ## add to project
@@ -7,7 +10,7 @@ requires zig `0.17.0`
 
 to use this with the zig build system, import as so:
 ```bash
-zig fetch --save git+https://github.com/eggyengine/clutch
+zig fetch --save git+https://git.tirbo.fish/eggy/clutch
 ```
 
 and then in `build.zig`:
