@@ -16,7 +16,7 @@ export default {
       {
         docs: {
           routeBasePath: '/',
-          editUrl: `https://git.tirbo.fish/eggy/clutch/_edit/${process.env.DOCS_BRANCH ?? 'main'}/docs/`,
+          editUrl: `https://github.com/eggyengine/clutch/edit/${process.env.DOCS_BRANCH ?? 'main'}/docs/`,
         },
         blog: false,
       },
@@ -30,7 +30,7 @@ export default {
         { to: '/', label: 'Guide', position: 'left' },
         // Zig's generated docs are copied to build/api by the workflow.
         { to: 'pathname:///api/', label: 'API reference', position: 'left' },
-        { href: 'https://git.tirbo.fish/eggy/clutch', label: 'Source', position: 'right' },
+        { href: 'https://github.com/eggyengine/clutch', label: 'GitHub', position: 'right' },
       ],
     },
     prism: { additionalLanguages: ['zig', 'bash'] },

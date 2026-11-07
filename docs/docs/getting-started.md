@@ -10,7 +10,7 @@ Clutch requires Zig `0.16.0`.
 ## Add the dependency
 
 ```bash
-zig fetch --save git+https://git.tirbo.fish/eggy/clutch
+zig fetch --save git+https://github.com/eggyengine/clutch
 ```
 
 Then import the module in `build.zig`:
